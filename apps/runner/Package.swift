@@ -3,14 +3,24 @@
 import PackageDescription
 
 let package = Package(
-    name: "runner",
-    platforms: [
-        .macOS(.v13)
-    ],
-    products: [
-        .executable(name: "aci-runner", targets: ["runner"])
-    ],
-    targets: [
-        .executableTarget(name: "runner")
-    ]
+  name: "ACIRunner",
+  platforms: [
+    .macOS(.v13)
+  ],
+  products: [
+    .executable(name: "aci-runner", targets: ["runner"])
+  ],
+  dependencies: [
+    .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.8.0")
+  ],
+  targets: [
+    .target(name: "ACIRunnerCore"),
+    .executableTarget(
+      name: "runner",
+      dependencies: [
+        "ACIRunnerCore",
+        .product(name: "ArgumentParser", package: "swift-argument-parser")
+      ]
+    )
+  ]
 )

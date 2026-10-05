@@ -1,6 +1,6 @@
 @main
 struct ACIRunner {
-    static func main() {
-        print("ACI Runner")
-    }
+  static func main() {
+    print("ACI Runner")
+  }
 }
