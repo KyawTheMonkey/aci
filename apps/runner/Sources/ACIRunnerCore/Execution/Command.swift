@@ -4,7 +4,7 @@ import Foundation
 ///
 /// Unlike ``StepSpecification``, this type contains resolved runtime values:
 /// the executable and working directory are file URLs, and the environment is
-/// ready to pass directly to `Foundation.Process`.
+/// ready to pass directly to the process-execution backend.
 public struct Command: Sendable, Equatable {
   /// The absolute location of the executable to launch.
   public let executableURL: URL

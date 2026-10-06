@@ -49,15 +49,15 @@ actor LogSequencer {
     self.handler = handler
   }
 
-  func emit(_ data: Data, stream: LogStream) async {
-    guard !data.isEmpty else { return }
+  func emit(_ text: String, stream: LogStream) async {
+    guard !text.isEmpty else { return }
 
     let event = LogEvent(
       sequence: nextSequence,
       stepID: stepID,
       stream: stream,
       timestamp: Date(),
-      text: String(decoding: data, as: UTF8.self)
+      text: text
     )
     nextSequence += 1
     await handler(event)

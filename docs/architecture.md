@@ -123,6 +123,16 @@ The runner is a separate macOS executable. It:
 
 The same runner binary supports a developer's local Mac and a dedicated self-hosted Mac. Hosted runners will use an ephemeral registration mode.
 
+#### Local command execution
+
+`JobExecutor` owns job orchestration: validation, workspace lifecycle, overall deadlines, sequential steps, and result classification. `CommandExecutor` owns one operating-system process invocation.
+
+Each command is launched with Swift Subprocess in a new session. The session creates a process group that can be signalled independently from the runner. On timeout or task cancellation, the runner sends `SIGTERM` to that group, waits for the configured grace period, and then escalates to `SIGKILL` when necessary.
+
+Stdout and stderr are consumed concurrently so either pipe can produce high-volume output without blocking the child. UTF-8 is decoded incrementally before chunks become sequenced `LogEvent` values. The sequence records the order in which the runner observes chunks; it cannot reconstruct a total byte-level ordering between two independent operating-system pipes.
+
+This process boundary improves lifecycle control but is not a sandbox. Repository commands still run with the runner account's host permissions. The detailed implementation contract and local verification commands are documented in [Runner execution](runner-execution.md).
+
 ### Next.js web application
 
 The web application provides:
@@ -339,6 +349,7 @@ Gradle execution, JUnit parsing, emulator management, APK/AAB artifacts, and Goo
 - Use HTTPS polling for the MVP; add Server-Sent Events or WebSockets where measurement shows value.
 - Use PostgreSQL for durable state and concurrency control.
 - Keep runner execution separate from the control-plane process.
+- Start every command in an isolated process group and tear down the group on timeout or cancellation.
 - Store public workflow input separately from compiled job specifications.
 - Treat self-hosted runners as trusted by their owning organization but untrusted by ACI and other tenants.
 - Defer hosted runners until self-hosted scheduling and cleanup are reliable.

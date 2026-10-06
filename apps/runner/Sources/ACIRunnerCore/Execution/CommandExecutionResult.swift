@@ -12,7 +12,7 @@ public enum CommandOutcome: String, Codable, Sendable, Equatable {
   case cancelled
 }
 
-/// A transport-safe representation of `Foundation.Process.TerminationReason`.
+/// A transport-safe representation of how an operating-system process ended.
 public enum CommandTerminationReason: String, Codable, Sendable, Equatable {
   case exit
   case uncaughtSignal
@@ -22,7 +22,7 @@ public enum CommandTerminationReason: String, Codable, Sendable, Equatable {
 public struct CommandExecutionResult: Codable, Sendable, Equatable {
   /// The runner-level interpretation of the process result.
   public let outcome: CommandOutcome
-  /// The process exit status or terminating signal value reported by Foundation.
+  /// The process exit status or terminating signal value reported by the OS.
   public let exitCode: Int32
   /// Whether the process exited normally or because of an uncaught signal.
   public let terminationReason: CommandTerminationReason

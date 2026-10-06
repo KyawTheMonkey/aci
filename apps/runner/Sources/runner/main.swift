@@ -52,8 +52,9 @@ struct CapabilitiesCommand: AsyncParsableCommand {
 
 /// Decodes and executes a normalized job from the local filesystem.
 ///
-/// This command is the PR 1 vertical slice. A later service command will obtain
-/// the same specification from the control plane and reuse `JobExecutor`.
+/// This command is the local execution entry point. A later service command
+/// will obtain the same specification from the control plane and reuse
+/// `JobExecutor`.
 struct ExecuteCommand: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "execute",

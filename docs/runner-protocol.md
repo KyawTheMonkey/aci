@@ -259,6 +259,8 @@ When `cancelRequested` is true, the runner:
 5. Performs workspace and secret cleanup.
 6. Reports a cancelled terminal result.
 
+The current local executor implements the same operating-system behavior through Swift Subprocess. Every command starts in a new session, and timeout or Swift task cancellation applies the graceful-then-forced teardown to the complete process group. See [Runner execution](runner-execution.md) for the in-process lifecycle. Server-driven cancellation will reuse that path when dispatch is implemented.
+
 ## Log upload
 
 ```http
@@ -298,6 +300,8 @@ Rules:
 - The server and runner both apply defense-in-depth secret redaction.
 - Invalid UTF-8 is encoded explicitly rather than silently corrupted.
 - Per-event, per-request, and per-job size limits are enforced.
+
+The local executor currently exposes UTF-8 text events and preserves valid scalars split across pipe buffers. The explicit binary/invalid-UTF-8 transport representation described above remains part of the future network protocol implementation.
 
 ## Step events
 

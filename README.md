@@ -22,6 +22,7 @@ The initial product supports native iOS projects. Android support will follow us
 - **Control plane:** Swift and Vapor
 - **Web application:** Next.js, TypeScript, and the App Router
 - **Runner:** Swift executable for macOS
+- **Process execution:** Swift Subprocess with isolated process-group teardown
 - **Primary database:** PostgreSQL
 - **Transient coordination:** Redis
 - **Artifacts:** S3-compatible object storage
@@ -68,6 +69,7 @@ aci/
 └── docs/
     ├── architecture.md
     ├── mvp.md
+    ├── runner-execution.md
     ├── runner-protocol.md
     └── threat-model.md
 ```
@@ -97,10 +99,25 @@ Hosted runners, Android, matrix builds, deployments, advanced caching, billing, 
 - Execution features remain platform-neutral; Xcode and Gradle are adapters.
 - The simplest reliable protocol is preferred before introducing streaming complexity.
 
+## Local runner development
+
+The current runner accepts a normalized JSON job, validates it, creates an isolated workspace, and executes its command steps sequentially:
+
+```bash
+cd apps/runner
+swift build
+swift test
+swift run aci-runner capabilities
+swift run aci-runner execute --job Fixtures/Jobs/success.json
+```
+
+The local runner uses Swift Subprocess for process isolation, concurrent output collection, timeout enforcement, and process-group cancellation. It is an execution boundary, not a security sandbox. See [Runner execution](docs/runner-execution.md) for its lifecycle, guarantees, and current limitations.
+
 ## Documentation
 
 - [MVP scope and milestones](docs/mvp.md)
 - [System architecture](docs/architecture.md)
+- [Runner execution](docs/runner-execution.md)
 - [Runner protocol](docs/runner-protocol.md)
 - [Threat model](docs/threat-model.md)
 

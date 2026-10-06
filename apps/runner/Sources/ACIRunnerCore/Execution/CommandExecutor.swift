@@ -1,5 +1,7 @@
 import Darwin
 import Foundation
+import Subprocess
+import System
 
 /// An infrastructure failure that prevented normal command execution.
 ///
@@ -14,7 +16,7 @@ public enum CommandExecutionError: LocalizedError, Sendable, Equatable {
     case let .invalidTimeout(timeout):
       "Command timeout must be greater than zero; received \(timeout)."
     case let .launchFailed(executable, reason):
-      "Unable to launch '\(executable)': \(reason)"
+      "Unable to execute '\(executable)': \(reason)"
     }
   }
 }
@@ -31,7 +33,7 @@ public protocol CommandExecuting: Sendable {
   ///   - timeoutSeconds: The effective deadline for this invocation.
   ///   - onLog: An asynchronous consumer for stdout and stderr chunks.
   /// - Returns: The process's terminal result.
-  /// - Throws: ``CommandExecutionError`` when the process cannot be launched.
+  /// - Throws: ``CommandExecutionError`` when the process cannot be executed.
   func execute(
     _ command: Command,
     stepID: String,
@@ -40,14 +42,20 @@ public protocol CommandExecuting: Sendable {
   ) async throws -> CommandExecutionResult
 }
 
-/// The Foundation `Process` implementation of ``CommandExecuting``.
+/// The Swift `Subprocess` implementation of ``CommandExecuting``.
 ///
-/// Stdout and stderr are drained concurrently to prevent a subprocess from
-/// blocking on a full pipe. Cancellation is bridged from Swift tasks to the
-/// operating-system process, with a delayed `SIGKILL` fallback.
+/// Every command starts in a new session so timeout and cancellation signals
+/// can target the complete process group without affecting the runner. Stdout
+/// and stderr are drained concurrently and decoded incrementally as UTF-8.
 public struct CommandExecutor: CommandExecuting, Sendable {
+  private let terminationGracePeriod: Duration
+
   /// Creates a process executor.
-  public init() {}
+  /// - Parameter terminationGracePeriod: How long a process group may respond
+  ///   to `SIGTERM` before `Subprocess` escalates to `SIGKILL`.
+  public init(terminationGracePeriod: Duration = .seconds(2)) {
+    self.terminationGracePeriod = terminationGracePeriod
+  }
 
   /// Executes a command with streaming output, timeout, and cancellation.
   public func execute(
@@ -60,101 +68,69 @@ public struct CommandExecutor: CommandExecuting, Sendable {
       throw CommandExecutionError.invalidTimeout(timeoutSeconds)
     }
 
-    let process = Process()
-    let stdoutPipe = Pipe()
-    let stderrPipe = Pipe()
     let sequencer = LogSequencer(stepID: stepID, handler: onLog)
-    let terminationController = ProcessTerminationController()
     let executionState = ExecutionState()
     let startedAt = Date()
+    let configuration = makeConfiguration(for: command)
 
-    process.executableURL = command.executableURL
-    process.arguments = command.arguments
-    process.environment = command.environment
-    process.currentDirectoryURL = command.workingDirectoryURL
-    process.standardOutput = stdoutPipe
-    process.standardError = stderrPipe
-
-    // Begin draining both pipes before launch so a fast or noisy subprocess
-    // cannot fill a pipe before the reader is ready.
-    let stdoutReader = makeReader(
-      handle: stdoutPipe.fileHandleForReading,
-      stream: .stdout,
-      sequencer: sequencer
-    )
-    let stderrReader = makeReader(
-      handle: stderrPipe.fileHandleForReading,
-      stream: .stderr,
-      sequencer: sequencer
-    )
-
-    // Install the termination handler before `run()` to avoid missing the exit
-    // of very short-lived commands such as `/usr/bin/true`.
-    let processTask = Task<ProcessExit, any Error> {
-      try await withCheckedThrowingContinuation { continuation in
-        process.terminationHandler = { terminatedProcess in
-          let reason: CommandTerminationReason = switch terminatedProcess.terminationReason {
-          case .exit: .exit
-          case .uncaughtSignal: .uncaughtSignal
-          @unknown default: .uncaughtSignal
+    // Keep the subprocess in its own task so both the explicit command timeout
+    // and cancellation of the enclosing job can request the same teardown.
+    let executionTask = Task {
+      try await Subprocess.run(
+        configuration,
+        input: .none,
+        output: .sequence,
+        error: .sequence
+      ) { execution in
+        try await withThrowingTaskGroup(of: Void.self) { group in
+          group.addTask {
+            try await drain(
+              execution.standardOutput,
+              stream: .stdout,
+              sequencer: sequencer
+            )
           }
-
-          continuation.resume(
-            returning: ProcessExit(
-              status: terminatedProcess.terminationStatus,
-              reason: reason
+          group.addTask {
+            try await drain(
+              execution.standardError,
+              stream: .stderr,
+              sequencer: sequencer
             )
-          )
-        }
-
-        do {
-          try process.run()
-          terminationController.attach(process)
-          try? stdoutPipe.fileHandleForWriting.close()
-          try? stderrPipe.fileHandleForWriting.close()
-        } catch {
-          try? stdoutPipe.fileHandleForWriting.close()
-          try? stderrPipe.fileHandleForWriting.close()
-          continuation.resume(
-            throwing: CommandExecutionError.launchFailed(
-              executable: command.executableURL.path,
-              reason: error.localizedDescription
-            )
-          )
+          }
+          try await group.waitForAll()
         }
       }
     }
 
-    // The timeout owns process termination; cancelling this task is the normal
-    // path when the subprocess completes before its deadline.
+    // Reaching the deadline cancels the subprocess task. `Subprocess` then
+    // runs the configured process-group teardown before the task completes.
     let timeoutTask = Task {
       do {
         try await Task.sleep(for: .seconds(timeoutSeconds))
         await executionState.markTimedOut()
-        terminationController.requestTermination()
+        executionTask.cancel()
       } catch {
         // Cancelling the timer is the normal path when the process exits first.
       }
     }
 
     do {
-      let processExit = try await withTaskCancellationHandler {
-        try await processTask.value
+      let result = try await withTaskCancellationHandler {
+        try await executionTask.value
       } onCancel: {
-        terminationController.requestTermination()
+        executionTask.cancel()
       }
 
       timeoutTask.cancel()
       _ = await timeoutTask.result
-      _ = await stdoutReader.result
-      _ = await stderrReader.result
 
+      let status = commandStatus(from: result.terminationStatus)
       let outcome: CommandOutcome
       if Task.isCancelled {
         outcome = .cancelled
       } else if await executionState.didTimeOut {
         outcome = .timedOut
-      } else if processExit.status == 0 {
+      } else if result.terminationStatus.isSuccess {
         outcome = .succeeded
       } else {
         outcome = .failed
@@ -162,44 +138,93 @@ public struct CommandExecutor: CommandExecuting, Sendable {
 
       return CommandExecutionResult(
         outcome: outcome,
-        exitCode: processExit.status,
-        terminationReason: processExit.reason,
+        exitCode: status.code,
+        terminationReason: status.reason,
         startedAt: startedAt,
         finishedAt: Date()
       )
     } catch {
       timeoutTask.cancel()
-      terminationController.requestTermination()
-      try? stdoutPipe.fileHandleForReading.close()
-      try? stderrPipe.fileHandleForReading.close()
-      _ = await stdoutReader.result
-      _ = await stderrReader.result
-      throw error
+      executionTask.cancel()
+      _ = await timeoutTask.result
+      _ = await executionTask.result
+
+      // Cancellation can surface as `CancellationError` before a termination
+      // status is available. The teardown has still completed by this point.
+      let didTimeOut = await executionState.didTimeOut
+      if Task.isCancelled || didTimeOut {
+        return CommandExecutionResult(
+          outcome: Task.isCancelled ? .cancelled : .timedOut,
+          exitCode: SIGKILL,
+          terminationReason: .uncaughtSignal,
+          startedAt: startedAt,
+          finishedAt: Date()
+        )
+      }
+
+      throw CommandExecutionError.launchFailed(
+        executable: command.executableURL.path,
+        reason: String(describing: error)
+      )
     }
   }
 
-  private func makeReader(
-    handle: FileHandle,
+  private func makeConfiguration(for command: Command) -> Subprocess.Configuration {
+    var platformOptions = Subprocess.PlatformOptions()
+    // A new session also creates an isolated process group whose ID is the
+    // child PID. This makes group-directed teardown safe for the runner.
+    platformOptions.createSession = true
+    platformOptions.teardownSequence = [
+      .gracefulShutDown(
+        toProcessGroup: true,
+        allowedDurationToNextStep: terminationGracePeriod
+      )
+    ]
+
+    let environment = Dictionary(
+      uniqueKeysWithValues: command.environment.map { key, value in
+        (Subprocess.Environment.Key(rawValue: key)!, value)
+      }
+    )
+
+    return Subprocess.Configuration(
+      executable: .path(FilePath(command.executableURL.path)),
+      arguments: Subprocess.Arguments(command.arguments),
+      environment: .custom(environment),
+      workingDirectory: FilePath(command.workingDirectoryURL.path),
+      platformOptions: platformOptions
+    )
+  }
+
+  private func commandStatus(
+    from status: Subprocess.TerminationStatus
+  ) -> (code: Int32, reason: CommandTerminationReason) {
+    switch status {
+    case let .exited(code):
+      (code, .exit)
+    case let .signaled(signal):
+      (signal, .uncaughtSignal)
+    }
+  }
+
+  private func drain(
+    _ output: SubprocessOutputSequence,
     stream: LogStream,
     sequencer: LogSequencer
-  ) -> Task<Void, Never> {
-    Task.detached(priority: .utility) {
-      do {
-        while !Task.isCancelled,
-              let data = try handle.read(upToCount: 4_096),
-              !data.isEmpty {
-          await sequencer.emit(data, stream: stream)
-        }
-      } catch {
-        // Closing the handle during cancellation is an expected shutdown path.
+  ) async throws {
+    var decoder = IncrementalUTF8Decoder()
+
+    for try await buffer in output {
+      let data = Data(buffer: buffer)
+      if let text = decoder.decode(data), !text.isEmpty {
+        await sequencer.emit(text, stream: stream)
       }
     }
-  }
-}
 
-private struct ProcessExit: Sendable {
-  let status: Int32
-  let reason: CommandTerminationReason
+    if let text = decoder.finish(), !text.isEmpty {
+      await sequencer.emit(text, stream: stream)
+    }
+  }
 }
 
 private actor ExecutionState {
@@ -210,49 +235,49 @@ private actor ExecutionState {
   }
 }
 
-/// Coordinates termination requests that may arrive before or after launch.
-///
-/// `Foundation.Process` is shared with synchronous cancellation callbacks, so
-/// the small amount of mutable attachment state is protected by a lock.
-private final class ProcessTerminationController: @unchecked Sendable {
-  private let lock = NSLock()
-  private var process: Process?
-  private var terminationRequested = false
+/// Preserves an incomplete UTF-8 scalar between arbitrary pipe buffers.
+private struct IncrementalUTF8Decoder {
+  private var pendingBytes: [UInt8] = []
 
-  func attach(_ process: Process) {
-    lock.lock()
-    self.process = process
-    let shouldTerminate = terminationRequested
-    lock.unlock()
+  mutating func decode(_ data: Data) -> String? {
+    pendingBytes.append(contentsOf: data)
+    let completePrefixCount = completePrefixLength(in: pendingBytes)
+    guard completePrefixCount > 0 else { return nil }
 
-    if shouldTerminate {
-      terminate(process)
-    }
+    let completeBytes = pendingBytes.prefix(completePrefixCount)
+    pendingBytes.removeFirst(completePrefixCount)
+    return String(decoding: completeBytes, as: UTF8.self)
   }
 
-  func requestTermination() {
-    lock.lock()
-    terminationRequested = true
-    let process = process
-    lock.unlock()
-
-    if let process {
-      terminate(process)
-    }
+  mutating func finish() -> String? {
+    guard !pendingBytes.isEmpty else { return nil }
+    defer { pendingBytes.removeAll(keepingCapacity: false) }
+    return String(decoding: pendingBytes, as: UTF8.self)
   }
 
-  private func terminate(_ process: Process) {
-    guard process.isRunning else { return }
+  /// Returns a prefix that cannot end inside a potentially valid UTF-8 scalar.
+  private func completePrefixLength(in bytes: [UInt8]) -> Int {
+    guard let lastByte = bytes.last else { return 0 }
+    if lastByte & 0b1000_0000 == 0 { return bytes.count }
 
-    process.terminate()
-    let pid = process.processIdentifier
-
-    // A command may ignore SIGTERM. Escalate after a grace period so the job
-    // cannot keep a runner occupied forever.
-    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
-      if process.isRunning {
-        Darwin.kill(pid, SIGKILL)
-      }
+    var leadIndex = bytes.count - 1
+    var continuationCount = 0
+    while leadIndex >= 0,
+          bytes[leadIndex] & 0b1100_0000 == 0b1000_0000,
+          continuationCount < 3 {
+      continuationCount += 1
+      leadIndex -= 1
     }
+
+    guard leadIndex >= 0 else { return bytes.count }
+    let expectedLength: Int
+    switch bytes[leadIndex] {
+    case 0xC2...0xDF: expectedLength = 2
+    case 0xE0...0xEF: expectedLength = 3
+    case 0xF0...0xF4: expectedLength = 4
+    default: return bytes.count
+    }
+
+    return continuationCount + 1 < expectedLength ? leadIndex : bytes.count
   }
 }

@@ -72,15 +72,15 @@ The initial user is a native iOS developer or small iOS team that:
 
 ### Tasks
 
-- [ ] Define a versioned, normalized JSON job specification.
-- [ ] Discover macOS, architecture, Xcode, simulator, disk, and concurrency capabilities.
-- [ ] Create an isolated workspace for each job.
+- [x] Define a versioned, normalized JSON job specification.
+- [x] Discover macOS, architecture, Xcode, simulator, disk, and concurrency capabilities.
+- [x] Create an isolated workspace for each job.
 - [ ] Clone a repository and check out an exact commit SHA.
-- [ ] Execute commands with an explicit executable, argument list, environment, and working directory.
-- [ ] Stream stdout and stderr as ordered events.
-- [ ] Record step start time, finish time, exit code, and outcome.
-- [ ] Implement job timeout and process-tree cancellation.
-- [ ] Remove the workspace after success, failure, or cancellation.
+- [x] Execute commands with an explicit executable, argument list, environment, and working directory.
+- [x] Stream stdout and stderr as ordered events.
+- [x] Record step start time, finish time, exit code, and outcome.
+- [x] Implement job timeout and process-tree cancellation.
+- [x] Remove the workspace after success, failure, or cancellation.
 
 ### Complete when
 
