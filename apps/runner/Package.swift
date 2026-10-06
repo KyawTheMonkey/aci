@@ -21,6 +21,10 @@ let package = Package(
         "ACIRunnerCore",
         .product(name: "ArgumentParser", package: "swift-argument-parser")
       ]
+    ),
+    .testTarget(
+      name: "ACIRunnerCoreTests",
+      dependencies: ["ACIRunnerCore"]
     )
   ]
 )
