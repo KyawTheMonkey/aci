@@ -9,6 +9,7 @@ public struct JobExecutor: Sendable {
   private let validator: JobSpecificationValidator
   private let workspaceManager: any WorkspaceManaging
   private let commandExecutor: any CommandExecuting
+  private let repositoryPreparer: any RepositoryPreparing
 
   /// Creates a job executor with injectable filesystem and process backends.
   ///
@@ -17,11 +18,14 @@ public struct JobExecutor: Sendable {
   public init(
     validator: JobSpecificationValidator = .init(),
     workspaceManager: any WorkspaceManaging,
-    commandExecutor: any CommandExecuting = CommandExecutor()
+    commandExecutor: any CommandExecuting = CommandExecutor(),
+    repositoryPreparer: (any RepositoryPreparing)? = nil
   ) {
     self.validator = validator
     self.workspaceManager = workspaceManager
     self.commandExecutor = commandExecutor
+    self.repositoryPreparer = repositoryPreparer
+      ?? GitRepositoryPreparer(commandExecutor: commandExecutor)
   }
 
   /// Executes a job while discarding its streamed log events.
@@ -53,6 +57,89 @@ public struct JobExecutor: Sendable {
     }
 
     var stepResults: [StepResult] = []
+
+    if let repository = specification.repository {
+      let checkoutStartedAt = Date()
+
+      do {
+        try await repositoryPreparer.prepare(
+          repository,
+          in: workspace,
+          deadline: deadline,
+          onLog: { event in
+            await jobLogSequencer.forward(event)
+          }
+        )
+        stepResults.append(
+          StepResult(
+            stepID: GitRepositoryPreparer.stepID,
+            outcome: .succeeded,
+            exitCode: nil,
+            startedAt: checkoutStartedAt,
+            finishedAt: Date(),
+            failureReason: nil
+          )
+        )
+      } catch let error as RepositoryPreparationError {
+        let failure = repositoryFailure(from: error)
+        stepResults.append(
+          StepResult(
+            stepID: GitRepositoryPreparer.stepID,
+            outcome: failure.outcome,
+            exitCode: failure.exitCode,
+            startedAt: checkoutStartedAt,
+            finishedAt: Date(),
+            failureReason: error.localizedDescription
+          )
+        )
+
+        return makeJobResult(
+          specification: specification,
+          outcome: failure.outcome,
+          stepResults: stepResults,
+          startedAt: jobStartedAt,
+          failureReason: "Repository checkout failed: \(error.localizedDescription)"
+        )
+      } catch is CancellationError {
+        stepResults.append(
+          StepResult(
+            stepID: GitRepositoryPreparer.stepID,
+            outcome: .cancelled,
+            exitCode: nil,
+            startedAt: checkoutStartedAt,
+            finishedAt: Date(),
+            failureReason: "Repository checkout was cancelled."
+          )
+        )
+
+        return makeJobResult(
+          specification: specification,
+          outcome: .cancelled,
+          stepResults: stepResults,
+          startedAt: jobStartedAt,
+          failureReason: "Repository checkout was cancelled."
+        )
+      } catch {
+        stepResults.append(
+          StepResult(
+            stepID: GitRepositoryPreparer.stepID,
+            outcome: .infrastructureFailed,
+            exitCode: nil,
+            startedAt: checkoutStartedAt,
+            finishedAt: Date(),
+            failureReason: error.localizedDescription
+          )
+        )
+
+        return makeJobResult(
+          specification: specification,
+          outcome: .infrastructureFailed,
+          stepResults: stepResults,
+          startedAt: jobStartedAt,
+          failureReason: "Runner could not prepare the repository: \(error.localizedDescription)"
+        )
+      }
+    }
 
     for step in specification.steps {
       if Task.isCancelled {
@@ -196,6 +283,17 @@ public struct JobExecutor: Sendable {
     case .failed: "Command returned a nonzero exit code."
     case .timedOut: "Command timed out."
     case .cancelled: "Command was cancelled."
+    }
+  }
+
+  private func repositoryFailure(
+    from error: RepositoryPreparationError
+  ) -> (outcome: ExecutionOutcome, exitCode: Int32?) {
+    switch error {
+    case .deadlineExceeded:
+      (.timedOut, nil)
+    case let .commandFailed(_, result):
+      (executionOutcome(for: result.outcome), result.exitCode)
     }
   }
 

@@ -202,6 +202,9 @@ Self-hosted runners belong to the user's trust domain. ACI cannot protect files 
 - Mint short-lived, repository-scoped GitHub installation tokens.
 - Deliver them only to a valid active lease.
 - Prefer temporary credential helpers or protected headers over credential-bearing URLs.
+- Reject clone URLs containing user information, query parameters, or fragments.
+- Fetch and check out a complete immutable commit SHA rather than a mutable branch or tag.
+- Disable inherited global and system Git configuration during repository preparation.
 - Remove helpers and Git configuration during cleanup.
 - Redact credentials from logs.
 

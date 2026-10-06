@@ -129,6 +129,8 @@ The same runner binary supports a developer's local Mac and a dedicated self-hos
 
 Each command is launched with Swift Subprocess in a new session. The session creates a process group that can be signalled independently from the runner. On timeout or task cancellation, the runner sends `SIGTERM` to that group, waits for the configured grace period, and then escalates to `SIGKILL` when necessary.
 
+When a normalized job includes a repository, the runner initializes Git inside the new workspace, fetches only the complete requested commit SHA, and enters detached-HEAD state before user commands begin. Clone URLs must be credential-free HTTPS URLs; authentication will be injected separately through the active job lease.
+
 Stdout and stderr are consumed concurrently so either pipe can produce high-volume output without blocking the child. UTF-8 is decoded incrementally before chunks become sequenced `LogEvent` values. The sequence records the order in which the runner observes chunks; it cannot reconstruct a total byte-level ordering between two independent operating-system pipes.
 
 This process boundary improves lifecycle control but is not a sandbox. Repository commands still run with the runner account's host permissions. The detailed implementation contract and local verification commands are documented in [Runner execution](runner-execution.md).

@@ -7,6 +7,7 @@ struct JobSpecificationTests {
   @Test("A specification survives a JSON round trip")
   func roundTrip() throws {
     let original = makeJob(
+      repository: makeRepository(),
       steps: [
         makeStep(
           arguments: ["hello"],

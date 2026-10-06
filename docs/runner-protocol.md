@@ -154,28 +154,24 @@ When a job is available, the server transactionally assigns it and returns:
   "specification": {
     "version": 1,
     "repository": {
-      "provider": "github",
-      "owner": "example",
-      "name": "ios-app",
+      "cloneURL": "https://github.com/example/ios-app.git",
       "commitSHA": "40-character-sha"
     },
     "workspace": {
-      "clean": true
+      "cleanAfterExecution": true
     },
     "timeoutSeconds": 1800,
     "steps": [
       {
-        "id": "checkout",
-        "type": "checkout"
-      },
-      {
         "id": "test",
-        "type": "command",
         "name": "Run tests",
+        "kind": "command",
         "executable": "/bin/zsh",
         "arguments": ["-lc", "xcodebuild test -scheme Example"],
         "environment": {},
-        "timeoutSeconds": 1500
+        "workingDirectory": null,
+        "timeoutSeconds": 1500,
+        "continueOnError": false
       }
     ],
     "artifacts": [
@@ -189,6 +185,8 @@ When a job is available, the server transactionally assigns it and returns:
 ```
 
 The runner must reject unsupported specification versions before starting execution.
+
+The clone URL is credential-free. It is compiled by the control plane from an authorized repository record rather than accepted directly from repository workflow text. The runner requires an absolute HTTPS URL and a complete lowercase 40-character commit SHA. Repository preparation is synthesized as the `checkout` result before the listed command steps.
 
 ## Checkout credentials
 
@@ -208,6 +206,8 @@ The runner must:
 - Avoid embedding credentials permanently in Git configuration.
 - Redact the value from logs.
 - Delete temporary credential helpers during cleanup.
+
+Repository preparation initializes an empty workspace, fetches only the requested commit with no tags and depth one, and checks out that SHA in detached-HEAD mode. It does not resolve a branch or tag name at execution time. Host-level Git configuration and interactive credential prompts are disabled; future authenticated checkout will supply a temporary, lease-scoped mechanism explicitly.
 
 ## Starting execution
 

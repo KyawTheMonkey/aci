@@ -19,6 +19,12 @@ public struct JobSpecification: Codable, Sendable, Equatable {
   /// Workspace creation and cleanup behavior.
   public let workspace: WorkspaceSpecification
 
+  /// Source to prepare before executing steps, when this job needs a checkout.
+  ///
+  /// Local diagnostic jobs may omit a repository. Server-created CI jobs will
+  /// require one at the workflow-compilation boundary.
+  public let repository: RepositorySpecification?
+
   /// Commands to execute sequentially.
   public let steps: [StepSpecification]
 
@@ -31,6 +37,7 @@ public struct JobSpecification: Codable, Sendable, Equatable {
     jobID: UUID,
     timeoutSeconds: Int,
     workspace: WorkspaceSpecification,
+    repository: RepositorySpecification? = nil,
     steps: [StepSpecification],
     artifacts: [ArtifactSpecification]
   ) {
@@ -38,6 +45,7 @@ public struct JobSpecification: Codable, Sendable, Equatable {
     self.jobID = jobID
     self.timeoutSeconds = timeoutSeconds
     self.workspace = workspace
+    self.repository = repository
     self.steps = steps
     self.artifacts = artifacts
   }

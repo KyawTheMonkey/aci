@@ -25,6 +25,59 @@ struct JobExecutorTests {
     #expect(await commandExecutor.executedStepIDs == ["first", "second"])
   }
 
+  @Test("Prepares the repository before command steps")
+  func preparesRepositoryFirst() async throws {
+    let base = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: base) }
+    let commandExecutor = StubCommandExecutor(responses: [
+      .result(makeCommandResult(outcome: .succeeded, exitCode: 0))
+    ])
+    let repositoryPreparer = StubRepositoryPreparer(response: .success)
+    let executor = JobExecutor(
+      workspaceManager: try WorkspaceManager(baseDirectory: base),
+      commandExecutor: commandExecutor,
+      repositoryPreparer: repositoryPreparer
+    )
+    let repository = makeRepository()
+
+    let result = try await executor.execute(makeJob(repository: repository))
+
+    #expect(result.outcome == .succeeded)
+    #expect(result.stepResults.map(\.stepID) == ["checkout", "test"])
+    #expect(await repositoryPreparer.preparedRepositories == [repository])
+    #expect(await commandExecutor.executedStepIDs == ["test"])
+  }
+
+  @Test("A checkout failure prevents command steps from running")
+  func checkoutFailureStopsJob() async throws {
+    let base = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: base) }
+    let commandExecutor = StubCommandExecutor(responses: [
+      .result(makeCommandResult(outcome: .succeeded, exitCode: 0))
+    ])
+    let checkoutResult = makeCommandResult(outcome: .failed, exitCode: 128)
+    let repositoryPreparer = StubRepositoryPreparer(
+      response: .failure(
+        .commandFailed(stage: .fetch, result: checkoutResult)
+      )
+    )
+    let executor = JobExecutor(
+      workspaceManager: try WorkspaceManager(baseDirectory: base),
+      commandExecutor: commandExecutor,
+      repositoryPreparer: repositoryPreparer
+    )
+
+    let result = try await executor.execute(
+      makeJob(repository: makeRepository())
+    )
+
+    #expect(result.outcome == .failed)
+    #expect(result.stepResults.count == 1)
+    #expect(result.stepResults.first?.stepID == "checkout")
+    #expect(result.stepResults.first?.exitCode == 128)
+    #expect(await commandExecutor.executedStepIDs.isEmpty)
+  }
+
   @Test("Stops after a disallowed failure")
   func stopsAfterFailure() async throws {
     let base = try makeTemporaryDirectory()
@@ -156,6 +209,42 @@ private actor StubCommandExecutor: CommandExecuting {
       return result
     case let .failure(message):
       throw StubError(message: message)
+    }
+  }
+}
+
+private enum StubRepositoryResponse: Sendable {
+  case success
+  case failure(RepositoryPreparationError)
+}
+
+private actor StubRepositoryPreparer: RepositoryPreparing {
+  private let response: StubRepositoryResponse
+  private(set) var preparedRepositories: [RepositorySpecification] = []
+
+  init(response: StubRepositoryResponse) {
+    self.response = response
+  }
+
+  func prepare(
+    _ repository: RepositorySpecification,
+    in workspace: Workspace,
+    deadline: Date,
+    onLog: @escaping LogHandler
+  ) async throws {
+    preparedRepositories.append(repository)
+    await onLog(
+      LogEvent(
+        sequence: 0,
+        stepID: GitRepositoryPreparer.stepID,
+        stream: .stdout,
+        timestamp: Date(),
+        text: "checkout"
+      )
+    )
+
+    if case let .failure(error) = response {
+      throw error
     }
   }
 }

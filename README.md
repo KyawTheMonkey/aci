@@ -101,7 +101,7 @@ Hosted runners, Android, matrix builds, deployments, advanced caching, billing, 
 
 ## Local runner development
 
-The current runner accepts a normalized JSON job, validates it, creates an isolated workspace, and executes its command steps sequentially:
+The current runner accepts a normalized JSON job, validates it, optionally prepares an exact Git commit in an isolated workspace, and executes its command steps sequentially:
 
 ```bash
 cd apps/runner
@@ -123,7 +123,7 @@ The local runner uses Swift Subprocess for process isolation, concurrent output 
 
 ## Current implementation order
 
-1. Execute a local JSON job with the Swift runner.
+1. Execute a local JSON job, including an exact commit checkout, with the Swift runner.
 2. Persist jobs and state transitions in the Vapor control plane.
 3. Register a runner and dispatch jobs over HTTPS.
 4. Integrate GitHub webhooks and check runs.

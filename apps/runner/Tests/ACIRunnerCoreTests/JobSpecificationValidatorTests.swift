@@ -1,4 +1,5 @@
 import ACIRunnerCore
+import Foundation
 import Testing
 
 @Suite("Job specification validator")
@@ -23,6 +24,58 @@ struct JobSpecificationValidatorTests {
     expectValidationError(
       .invalidJobTimeout(received: 0, maximum: 86_400),
       for: makeJob(timeoutSeconds: 0)
+    )
+  }
+
+  @Test("A repository uses a credential-free HTTPS URL")
+  func invalidRepositoryURL() {
+    expectValidationError(
+      .invalidRepositoryURL,
+      for: makeJob(
+        repository: makeRepository(
+          cloneURL: URL(string: "http://github.com/example/ios-app.git")!
+        )
+      )
+    )
+  }
+
+  @Test("Repository credentials cannot be embedded in the clone URL")
+  func repositoryCredentials() {
+    expectValidationError(
+      .repositoryURLContainsCredentials,
+      for: makeJob(
+        repository: makeRepository(
+          cloneURL: URL(string: "https://token@github.com/example/ios-app.git")!
+        )
+      )
+    )
+  }
+
+  @Test("Repository URLs cannot carry query credentials")
+  func repositoryQuery() {
+    let cloneURL = URL(string: "https://github.com/example/ios-app.git?token=secret")!
+    expectValidationError(
+      .invalidRepositoryURL,
+      for: makeJob(repository: makeRepository(cloneURL: cloneURL))
+    )
+  }
+
+  @Test("A commit SHA must be complete lowercase hexadecimal")
+  func invalidCommitSHA() {
+    expectValidationError(
+      .invalidCommitSHA("ABC123"),
+      for: makeJob(repository: makeRepository(commitSHA: "ABC123"))
+    )
+  }
+
+  @Test("Checkout is reserved when repository preparation is enabled")
+  func reservedCheckoutStep() {
+    expectValidationError(
+      .reservedStepID(index: 0, id: "checkout"),
+      for: makeJob(
+        repository: makeRepository(),
+        steps: [makeStep(id: "checkout")]
+      )
     )
   }
 

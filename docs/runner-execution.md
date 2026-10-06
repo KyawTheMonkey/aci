@@ -4,7 +4,7 @@
 
 This document describes the command-execution path that is implemented in the macOS runner. It covers local JSON jobs today and defines the execution behavior that the future control-plane service will reuse.
 
-Repository checkout, remote job dispatch, network log upload, artifact upload, and runner registration are outside this implementation slice.
+Remote job dispatch, authenticated checkout, network log upload, artifact upload, and runner registration are outside this implementation slice.
 
 ## Try it locally
 
@@ -30,6 +30,8 @@ The failure and timeout fixtures intentionally make the CLI return a nonzero sta
 
 Pass `--workspace-root <path>` to place temporary job directories under a custom root. By default, they are created below `~/Library/Application Support/ACI/Runner/workspaces`.
 
+The bundled fixtures are command-only diagnostic jobs and omit the optional `repository` property. Server-created CI jobs will include a credential-free clone URL and exact commit SHA.
+
 ## Execution pipeline
 
 ```text
@@ -43,6 +45,9 @@ validate contract and paths
    |
    v
 create isolated workspace
+   |
+   v
+fetch and check out the exact commit, when requested
    |
    v
 resolve each step into an exact Command
@@ -67,6 +72,35 @@ remove workspace when configured
 `JobExecutor` coordinates the job. It validates the complete specification before creating a workspace, calculates the overall job deadline, resolves step working directories inside the workspace, merges step variables over the runner environment, and runs steps sequentially.
 
 `CommandExecutor` handles one command. It receives only resolved runtime values: an absolute executable path, an argument array, a complete environment, and a working-directory URL.
+
+## Repository preparation
+
+A normalized job may include:
+
+```json
+{
+  "repository": {
+    "cloneURL": "https://github.com/example/ios-app.git",
+    "commitSHA": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
+```
+
+The validator requires a credential-free HTTPS URL with no query or fragment and a complete lowercase 40-character SHA-1 commit identifier. Branches, tags, abbreviated SHAs, URL-embedded tokens, and SCP-style SSH locations are rejected.
+
+Repository preparation runs before user command steps:
+
+1. Initialize an empty Git repository in the job workspace.
+2. Fetch only the requested commit with no tags and depth one.
+3. Check out that exact SHA in detached-HEAD mode.
+
+The checkout does not depend on a mutable remote branch at execution time. Global and system Git configuration are disabled, and `GIT_TERMINAL_PROMPT=0` prevents a self-hosted runner from hanging on an interactive credential request.
+
+Checkout shares the overall job deadline and uses the same process-group cancellation and log pipeline as user commands. Its logs and result use the reserved synthetic `checkout` step identifier, which user command steps cannot reuse when a repository is present. A Git exit failure is a job failure; inability to launch Git is an infrastructure failure.
+
+Authentication is intentionally not part of this slice. The future runner protocol will provide a short-lived credential only after validating the runner, job attempt, and active lease. That credential must not be embedded in `cloneURL` or persisted in repository configuration.
+
+Submodule initialization, Git LFS authentication, sparse checkout, and repository caching are not implemented yet.
 
 ## Exact command invocation
 
@@ -169,6 +203,14 @@ The command-executor tests cover:
 - UTF-8 scalars split across separate writes.
 - Large simultaneous stdout and stderr streams.
 
+Repository-preparation tests create real temporary Git repositories and verify:
+
+- An older requested commit is checked out instead of the current branch tip.
+- An unknown but well-formed commit SHA fails during fetch.
+- Git is not launched after the overall job deadline.
+- Checkout failures prevent later command steps from running.
+- Clone URLs, commit SHAs, and the reserved checkout step ID are validated.
+
 Run the strict local verification suite with:
 
 ```bash
@@ -180,12 +222,12 @@ The runner package currently targets macOS 13 or later and pins Swift Subprocess
 
 ## Next implementation step
 
-The remaining Milestone 1 task is repository preparation:
+The Milestone 1 implementation checklist is complete. Its acceptance criterion still needs an end-to-end sample iOS project:
 
-1. Validate a repository checkout request.
-2. Obtain source into the isolated workspace.
-3. Check out the exact immutable commit SHA.
-4. Remove any temporary credential material.
-5. Hand the prepared workspace to the existing job-execution pipeline.
+1. Add a minimal committed Xcode project and test target.
+2. Create a normalized job that checks out its exact commit.
+3. Run `xcodebuild test` through `aci-runner execute`.
+4. Exercise compilation failure, test failure, timeout, cancellation, and an invalid commit SHA.
+5. Record the repeatable verification command in this guide.
 
-The checkout implementation must not weaken the existing rule that step working directories remain inside the job workspace.
+After that acceptance slice, development moves to the durable Vapor control plane: Fluent models, migrations, state transitions, and transactional job creation.

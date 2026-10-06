@@ -44,6 +44,9 @@ public struct JobSpecificationValidationLimits: Sendable, Equatable {
 public enum JobSpecificationError: LocalizedError, Sendable, Equatable {
   case unsupportedVersion(received: Int, supported: Int)
   case invalidJobTimeout(received: Int, maximum: Int)
+  case invalidRepositoryURL
+  case repositoryURLContainsCredentials
+  case invalidCommitSHA(String)
   case noSteps
   case tooManySteps(received: Int, maximum: Int)
   case emptyStepID(index: Int)
@@ -55,6 +58,7 @@ public enum JobSpecificationError: LocalizedError, Sendable, Equatable {
   case nonAbsoluteExecutable(stepID: String, path: String)
   case ambiguousExecutable(stepID: String, path: String)
   case invalidWorkingDirectory(stepID: String, path: String)
+  case reservedStepID(index: Int, id: String)
   case invalidEnvironmentVariable(stepID: String, name: String)
   case invalidArtifactPath(index: Int, path: String)
   case duplicateArtifactPath(String)
@@ -65,6 +69,12 @@ public enum JobSpecificationError: LocalizedError, Sendable, Equatable {
       "Unsupported job specification version \(received); this runner supports version \(supported)."
     case let .invalidJobTimeout(received, maximum):
       "Job timeout must be between 1 and \(maximum) seconds; received \(received)."
+    case .invalidRepositoryURL:
+      "Repository clone URL must be an absolute credential-free HTTPS URL without a query or fragment."
+    case .repositoryURLContainsCredentials:
+      "Repository clone URL must not contain credentials."
+    case let .invalidCommitSHA(commitSHA):
+      "Repository commit SHA must contain exactly 40 lowercase hexadecimal characters; received '\(commitSHA)'."
     case .noSteps:
       "A job must contain at least one step."
     case let .tooManySteps(received, maximum):
@@ -87,6 +97,8 @@ public enum JobSpecificationError: LocalizedError, Sendable, Equatable {
       "Step '\(stepID)' executable contains ambiguous path components: '\(path)'."
     case let .invalidWorkingDirectory(stepID, path):
       "Step '\(stepID)' working directory must be a safe workspace-relative path; received '\(path)'."
+    case let .reservedStepID(index, id):
+      "Step at index \(index) uses the reserved identifier '\(id)'."
     case let .invalidEnvironmentVariable(stepID, name):
       "Step '\(stepID)' contains an invalid environment variable name '\(name)'."
     case let .invalidArtifactPath(index, path):
@@ -118,7 +130,12 @@ public struct JobSpecificationValidator: Sendable {
   public func validate(_ specification: JobSpecification) throws {
     try validateVersion(specification.version)
     try validateJobTimeout(specification.timeoutSeconds)
-    try validateSteps(specification.steps, jobTimeoutSeconds: specification.timeoutSeconds)
+    try validateRepository(specification.repository)
+    try validateSteps(
+      specification.steps,
+      jobTimeoutSeconds: specification.timeoutSeconds,
+      reservesCheckoutStep: specification.repository != nil
+    )
     try validateArtifacts(specification.artifacts)
   }
 
@@ -140,9 +157,46 @@ public struct JobSpecificationValidator: Sendable {
     }
   }
 
+  private func validateRepository(_ repository: RepositorySpecification?) throws {
+    guard let repository else { return }
+
+    let cloneURL = repository.cloneURL
+    let renderedURL = cloneURL.absoluteString
+    guard renderedURL.count <= limits.maximumPathLength,
+          let components = URLComponents(url: cloneURL, resolvingAgainstBaseURL: false)
+    else {
+      throw JobSpecificationError.invalidRepositoryURL
+    }
+
+    guard components.user == nil, components.password == nil else {
+      throw JobSpecificationError.repositoryURLContainsCredentials
+    }
+
+    guard components.scheme?.lowercased() == "https",
+          let host = components.host,
+          !host.isEmpty,
+          !components.path.isEmpty,
+          components.path != "/",
+          components.query == nil,
+          components.fragment == nil
+    else {
+      throw JobSpecificationError.invalidRepositoryURL
+    }
+
+    let commitSHA = repository.commitSHA
+    guard commitSHA.count == 40,
+          commitSHA.unicodeScalars.allSatisfy({ scalar in
+            (48...57).contains(scalar.value) || (97...102).contains(scalar.value)
+          })
+    else {
+      throw JobSpecificationError.invalidCommitSHA(commitSHA)
+    }
+  }
+
   private func validateSteps(
     _ steps: [StepSpecification],
-    jobTimeoutSeconds: Int
+    jobTimeoutSeconds: Int,
+    reservesCheckoutStep: Bool
   ) throws {
     guard !steps.isEmpty else {
       throw JobSpecificationError.noSteps
@@ -161,6 +215,11 @@ public struct JobSpecificationValidator: Sendable {
       let trimmedID = step.id.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !trimmedID.isEmpty else {
         throw JobSpecificationError.emptyStepID(index: index)
+      }
+
+      if reservesCheckoutStep,
+         step.id == RepositorySpecification.checkoutStepID {
+        throw JobSpecificationError.reservedStepID(index: index, id: step.id)
       }
 
       guard trimmedID == step.id,

@@ -29,6 +29,7 @@ func makeJob(
   jobID: UUID = UUID(),
   timeoutSeconds: Int = 60,
   cleanAfterExecution: Bool = true,
+  repository: RepositorySpecification? = nil,
   steps: [StepSpecification] = [makeStep()],
   artifacts: [ArtifactSpecification] = []
 ) -> JobSpecification {
@@ -37,9 +38,17 @@ func makeJob(
     jobID: jobID,
     timeoutSeconds: timeoutSeconds,
     workspace: WorkspaceSpecification(cleanAfterExecution: cleanAfterExecution),
+    repository: repository,
     steps: steps,
     artifacts: artifacts
   )
+}
+
+func makeRepository(
+  cloneURL: URL = URL(string: "https://github.com/example/ios-app.git")!,
+  commitSHA: String = String(repeating: "a", count: 40)
+) -> RepositorySpecification {
+  RepositorySpecification(cloneURL: cloneURL, commitSHA: commitSHA)
 }
 
 func makeTemporaryDirectory(named name: String = UUID().uuidString) throws -> URL {
