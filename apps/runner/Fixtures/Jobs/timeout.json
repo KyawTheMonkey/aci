@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "jobID": "1D0964E9-590E-4230-AD9D-416B97ED4325",
+  "timeoutSeconds": 10,
+  "workspace": {
+    "cleanAfterExecution": true
+  },
+  "steps": [
+    {
+      "id": "sleep",
+      "name": "Exceed the step timeout",
+      "kind": "command",
+      "executable": "/bin/sleep",
+      "arguments": ["5"],
+      "environment": {},
+      "workingDirectory": null,
+      "timeoutSeconds": 1,
+      "continueOnError": false
+    }
+  ],
+  "artifacts": []
+}

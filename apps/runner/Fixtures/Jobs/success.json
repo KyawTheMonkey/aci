@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "jobID": "A1E974C8-8AEE-4B1A-A0BF-06448EA33431",
+  "timeoutSeconds": 30,
+  "workspace": {
+    "cleanAfterExecution": true
+  },
+  "steps": [
+    {
+      "id": "greeting",
+      "name": "Print a greeting",
+      "kind": "command",
+      "executable": "/usr/bin/printf",
+      "arguments": ["ACI runner is ready.\\n"],
+      "environment": {},
+      "workingDirectory": null,
+      "timeoutSeconds": 10,
+      "continueOnError": false
+    }
+  ],
+  "artifacts": []
+}

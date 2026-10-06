@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "jobID": "6E50C6EC-42B0-437A-A9EA-F567847BB725",
+  "timeoutSeconds": 30,
+  "workspace": {
+    "cleanAfterExecution": true
+  },
+  "steps": [
+    {
+      "id": "fail",
+      "name": "Return a failing exit code",
+      "kind": "command",
+      "executable": "/usr/bin/false",
+      "arguments": [],
+      "environment": {},
+      "workingDirectory": null,
+      "timeoutSeconds": 10,
+      "continueOnError": false
+    }
+  ],
+  "artifacts": []
+}

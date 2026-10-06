@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "jobID": "E18E4185-156D-484A-B8DB-AE93D3033020",
+  "timeoutSeconds": 30,
+  "workspace": {
+    "cleanAfterExecution": true
+  },
+  "steps": [
+    {
+      "id": "allowed-failure",
+      "name": "Fail without stopping the job",
+      "kind": "command",
+      "executable": "/usr/bin/false",
+      "arguments": [],
+      "environment": {},
+      "workingDirectory": null,
+      "timeoutSeconds": 10,
+      "continueOnError": true
+    },
+    {
+      "id": "after-failure",
+      "name": "Run after the allowed failure",
+      "kind": "command",
+      "executable": "/usr/bin/printf",
+      "arguments": ["Execution continued.\\n"],
+      "environment": {},
+      "workingDirectory": null,
+      "timeoutSeconds": 10,
+      "continueOnError": false
+    }
+  ],
+  "artifacts": []
+}
