@@ -39,6 +39,32 @@ struct JobSpecificationValidatorTests {
     )
   }
 
+  @Test("Local repository URLs are rejected by default")
+  func localRepositoryRejectedByDefault() {
+    expectValidationError(
+      .invalidRepositoryURL,
+      for: makeJob(
+        repository: makeRepository(
+          cloneURL: URL(fileURLWithPath: "/private/tmp/aci-source")
+        )
+      )
+    )
+  }
+
+  @Test("Local repository URLs require an explicit validation policy")
+  func localRepositoryAllowedForAcceptanceTesting() throws {
+    let localValidator = JobSpecificationValidator(
+      limits: JobSpecificationValidationLimits(allowsFileRepositoryURLs: true)
+    )
+    let specification = makeJob(
+      repository: makeRepository(
+        cloneURL: URL(fileURLWithPath: "/private/tmp/aci-source")
+      )
+    )
+
+    try localValidator.validate(specification)
+  }
+
   @Test("Repository credentials cannot be embedded in the clone URL")
   func repositoryCredentials() {
     expectValidationError(

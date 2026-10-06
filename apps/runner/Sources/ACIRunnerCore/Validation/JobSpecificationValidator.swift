@@ -18,6 +18,8 @@ public struct JobSpecificationValidationLimits: Sendable, Equatable {
   public let maximumIdentifierLength: Int
   /// The largest accepted executable, working-directory, or artifact path.
   public let maximumPathLength: Int
+  /// Whether local `file://` repositories are accepted for offline testing.
+  public let allowsFileRepositoryURLs: Bool
 
   /// Creates runner-side validation limits.
   public init(
@@ -26,7 +28,8 @@ public struct JobSpecificationValidationLimits: Sendable, Equatable {
     maximumStepTimeoutSeconds: Int = 21_600,
     maximumStepCount: Int = 100,
     maximumIdentifierLength: Int = 128,
-    maximumPathLength: Int = 4_096
+    maximumPathLength: Int = 4_096,
+    allowsFileRepositoryURLs: Bool = false
   ) {
     self.supportedVersion = supportedVersion
     self.maximumJobTimeoutSeconds = maximumJobTimeoutSeconds
@@ -34,6 +37,7 @@ public struct JobSpecificationValidationLimits: Sendable, Equatable {
     self.maximumStepCount = maximumStepCount
     self.maximumIdentifierLength = maximumIdentifierLength
     self.maximumPathLength = maximumPathLength
+    self.allowsFileRepositoryURLs = allowsFileRepositoryURLs
   }
 }
 
@@ -70,7 +74,7 @@ public enum JobSpecificationError: LocalizedError, Sendable, Equatable {
     case let .invalidJobTimeout(received, maximum):
       "Job timeout must be between 1 and \(maximum) seconds; received \(received)."
     case .invalidRepositoryURL:
-      "Repository clone URL must be an absolute credential-free HTTPS URL without a query or fragment."
+      "Repository clone URL must use an allowed absolute scheme without a query or fragment."
     case .repositoryURLContainsCredentials:
       "Repository clone URL must not contain credentials."
     case let .invalidCommitSHA(commitSHA):
@@ -172,9 +176,14 @@ public struct JobSpecificationValidator: Sendable {
       throw JobSpecificationError.repositoryURLContainsCredentials
     }
 
-    guard components.scheme?.lowercased() == "https",
-          let host = components.host,
-          !host.isEmpty,
+    let isHTTPS = components.scheme?.lowercased() == "https"
+      && !(components.host?.isEmpty ?? true)
+    let isAllowedFileURL = limits.allowsFileRepositoryURLs
+      && cloneURL.isFileURL
+      && (components.host?.isEmpty ?? true)
+      && NSString(string: components.path).isAbsolutePath
+
+    guard isHTTPS || isAllowedFileURL,
           !components.path.isEmpty,
           components.path != "/",
           components.query == nil,

@@ -63,6 +63,10 @@ aci/
 │   └── web/             # Next.js dashboard
 ├── packages/
 │   └── api/             # OpenAPI contract and generated clients
+├── samples/
+│   └── ios/ACISample/   # iOS simulator acceptance workload
+├── scripts/
+│   └── verify-runner-ios.sh
 ├── infrastructure/
 │   ├── docker/          # Local development services
 │   └── migrations/      # Infrastructure-managed migrations, if needed
@@ -112,6 +116,14 @@ swift run aci-runner execute --job Fixtures/Jobs/success.json
 ```
 
 The local runner uses Swift Subprocess for process isolation, concurrent output collection, timeout enforcement, and process-group cancellation. It is an execution boundary, not a security sandbox. See [Runner execution](docs/runner-execution.md) for its lifecycle, guarantees, and current limitations.
+
+Run the complete local iOS acceptance matrix with:
+
+```bash
+./scripts/verify-runner-ios.sh --all
+```
+
+The harness creates a temporary Git repository, checks out its exact commit through the runner, and exercises successful XCTest execution, compilation failure, test failure, timeout, and an unknown commit SHA.
 
 ## Documentation
 

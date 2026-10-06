@@ -70,13 +70,25 @@ struct ExecuteCommand: AsyncParsableCommand {
   )
   var workspaceRoot: String?
 
+  @Flag(
+    name: .long,
+    help: "Allow file:// repository URLs for offline local acceptance testing."
+  )
+  var allowLocalRepository = false
+
   func run() async throws {
     let specificationURL = URL(fileURLWithPath: job).standardizedFileURL
     let data = try Data(contentsOf: specificationURL)
     let specification = try JSONDecoder().decode(JobSpecification.self, from: data)
     let workspaceBase = resolvedWorkspaceRoot()
     let workspaceManager = try WorkspaceManager(baseDirectory: workspaceBase)
-    let executor = JobExecutor(workspaceManager: workspaceManager)
+    let validationLimits = JobSpecificationValidationLimits(
+      allowsFileRepositoryURLs: allowLocalRepository
+    )
+    let executor = JobExecutor(
+      validator: JobSpecificationValidator(limits: validationLimits),
+      workspaceManager: workspaceManager
+    )
 
     let result = try await executor.execute(specification) { event in
       let handle = event.stream == .stdout

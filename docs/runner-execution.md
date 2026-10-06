@@ -32,6 +32,14 @@ Pass `--workspace-root <path>` to place temporary job directories under a custom
 
 The bundled fixtures are command-only diagnostic jobs and omit the optional `repository` property. Server-created CI jobs will include a credential-free clone URL and exact commit SHA.
 
+For an end-to-end iOS workload, run:
+
+```bash
+./scripts/verify-runner-ios.sh --all
+```
+
+The script selects an available iPhone Simulator, creates a temporary Git repository from `samples/ios/ACISample`, commits it, generates normalized exact-SHA jobs, and invokes the release runner. Run it without `--all` when only the successful checkout and XCTest path is needed.
+
 ## Execution pipeline
 
 ```text
@@ -87,6 +95,8 @@ A normalized job may include:
 ```
 
 The validator requires a credential-free HTTPS URL with no query or fragment and a complete lowercase 40-character SHA-1 commit identifier. Branches, tags, abbreviated SHAs, URL-embedded tokens, and SCP-style SSH locations are rejected.
+
+The CLI's `--allow-local-repository` flag additionally accepts absolute local `file://` URLs for the offline acceptance harness. The option is disabled by default and is not part of the server-to-runner production contract.
 
 Repository preparation runs before user command steps:
 
@@ -211,6 +221,14 @@ Repository-preparation tests create real temporary Git repositories and verify:
 - Checkout failures prevent later command steps from running.
 - Clone URLs, commit SHAs, and the reserved checkout step ID are validated.
 
+The iOS acceptance harness additionally verifies:
+
+- Exact-SHA checkout followed by a successful iOS Simulator XCTest run.
+- Swift compilation failures are reported as failed jobs.
+- XCTest failures are reported as failed jobs.
+- A long-running `xcodebuild` process tree is terminated at its step deadline.
+- A valid but unknown commit SHA fails before user commands run.
+
 Run the strict local verification suite with:
 
 ```bash
@@ -222,12 +240,10 @@ The runner package currently targets macOS 13 or later and pins Swift Subprocess
 
 ## Next implementation step
 
-The Milestone 1 implementation checklist is complete. Its acceptance criterion still needs an end-to-end sample iOS project:
+Milestone 1 is accepted through the Swift test suite and the repeatable iOS harness. Development now moves to the durable Vapor control plane:
 
-1. Add a minimal committed Xcode project and test target.
-2. Create a normalized job that checks out its exact commit.
-3. Run `xcodebuild test` through `aci-runner execute`.
-4. Exercise compilation failure, test failure, timeout, cancellation, and an invalid commit SHA.
-5. Record the repeatable verification command in this guide.
-
-After that acceptance slice, development moves to the durable Vapor control plane: Fluent models, migrations, state transitions, and transactional job creation.
+1. Define the first job, attempt, step, and runner state machines.
+2. Add Fluent models and migrations for those aggregates.
+3. Enforce legal transitions in a database-independent domain layer.
+4. Create queued jobs transactionally.
+5. Keep PostgreSQL authoritative for every transition.

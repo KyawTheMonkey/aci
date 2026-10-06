@@ -9,7 +9,10 @@ public struct RepositorySpecification: Codable, Sendable, Equatable {
   /// The reserved identifier used for synthesized checkout logs and results.
   public static let checkoutStepID = "checkout"
 
-  /// The credential-free HTTPS URL used to fetch repository objects.
+  /// The credential-free URL used to fetch repository objects.
+  ///
+  /// Production jobs use HTTPS. Local acceptance tests may explicitly enable
+  /// `file://` URLs at the runner CLI boundary.
   public let cloneURL: URL
 
   /// The complete lowercase SHA-1 commit identifier to check out.

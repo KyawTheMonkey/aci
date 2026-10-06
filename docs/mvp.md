@@ -92,6 +92,14 @@ aci-runner execute ./sample-job.json
 
 The runner must correctly handle successful tests, compilation failure, test failure, timeout, cancellation, and invalid commit SHAs.
 
+Local acceptance command:
+
+```bash
+./scripts/verify-runner-ios.sh --all
+```
+
+The harness verifies the real checkout and `xcodebuild test` paths. Task cancellation and process-tree teardown remain covered by the runner's deterministic Swift test suite.
+
 ## Milestone 2 — Durable control plane
 
 ### Tasks
