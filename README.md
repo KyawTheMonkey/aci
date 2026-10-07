@@ -66,6 +66,8 @@ aci/
 ├── samples/
 │   └── ios/ACISample/   # iOS simulator acceptance workload
 ├── scripts/
+│   ├── benchmark-runner.sh
+│   ├── benchmark-runner-resources.sh
 │   └── verify-runner-ios.sh
 ├── infrastructure/
 │   ├── docker/          # Local development services
@@ -73,6 +75,7 @@ aci/
 └── docs/
     ├── architecture.md
     ├── mvp.md
+    ├── runner-performance.md
     ├── runner-execution.md
     ├── runner-protocol.md
     └── threat-model.md
@@ -125,11 +128,20 @@ Run the complete local iOS acceptance matrix with:
 
 The harness creates a temporary Git repository, checks out its exact commit through the runner, and exercises successful XCTest execution, compilation failure, test failure, timeout, and an unknown commit SHA.
 
+Run the complete runner performance suite with:
+
+```bash
+./scripts/benchmark-runner.sh
+```
+
+The suite measures job decoding, validation, orchestration, real process launch, and log draining, then enforces release executable, latency, and memory ceilings. Pull requests compare benchmarks against their base commit on the same macOS host. See [Runner performance](docs/runner-performance.md) for the initial results, regression policy, and the methodology required for a fair vendor comparison.
+
 ## Documentation
 
 - [MVP scope and milestones](docs/mvp.md)
 - [System architecture](docs/architecture.md)
 - [Runner execution](docs/runner-execution.md)
+- [Runner performance and competitive methodology](docs/runner-performance.md)
 - [Runner protocol](docs/runner-protocol.md)
 - [Threat model](docs/threat-model.md)
 

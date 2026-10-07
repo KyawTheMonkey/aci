@@ -1,0 +1,127 @@
+name: Runner performance
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/runner-performance.yml"
+      - "apps/runner/**"
+      - "docs/runner-performance.md"
+      - "scripts/benchmark-runner*.sh"
+
+concurrency:
+  group: runner-performance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: Release runner guardrails
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record benchmark host
+        run: |
+          {
+            echo "## Runner benchmark host"
+            echo '```text'
+            sw_vers
+            xcodebuild -version
+            swift --version
+            sysctl -n hw.model
+            sysctl -n hw.ncpu
+            sysctl -n hw.memsize
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce absolute release-runner budgets
+        run: |
+          ./scripts/benchmark-runner-resources.sh \
+            --output "$RUNNER_TEMP/runner-resources.json"
+
+      - name: Upload resource measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-resource-measurements
+          path: ${{ runner.temp }}/runner-resources.json
+
+      - name: Detect an existing benchmark suite on the base commit
+        id: benchmark-base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git cat-file -e \
+            "$BASE_SHA:apps/runner/Performance/Benchmarks/ACIRunnerBenchmarks/ACIRunnerBenchmarks.swift"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "This pull request bootstraps the benchmark suite; no base comparison exists yet." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Measure the base commit
+        if: steps.benchmark-base.outputs.available == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        working-directory: apps/runner/Performance
+        run: |
+          git checkout --detach "$BASE_SHA"
+          swift package --allow-writing-to-directory .benchmarkBaselines/ \
+            benchmark baseline update base \
+            --target ACIRunnerBenchmarks \
+            --no-progress \
+            --quiet
+
+      - name: Restore the pull request commit
+        if: steps.benchmark-base.outputs.available == 'true'
+        run: git checkout --detach "$GITHUB_SHA"
+
+      - name: Measure the pull request
+        if: steps.benchmark-base.outputs.available == 'true'
+        working-directory: apps/runner/Performance
+        run: |
+          swift package --allow-writing-to-directory .benchmarkBaselines/ \
+            benchmark baseline update candidate \
+            --target ACIRunnerBenchmarks \
+            --no-progress \
+            --quiet
+
+      - name: Reject benchmark regressions
+        if: steps.benchmark-base.outputs.available == 'true'
+        working-directory: apps/runner/Performance
+        run: |
+          set +e
+          swift package benchmark baseline check base candidate \
+            --target ACIRunnerBenchmarks \
+            --format markdown \
+            --no-progress | tee -a "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          # Benchmark returns 0 for equivalent results, 2 for regressions,
+          # and 4 when it found improvements without regressions.
+          if [[ "$status" -eq 0 || "$status" -eq 4 ]]; then
+            exit 0
+          fi
+          if [[ "$status" -eq 2 ]]; then
+            echo "Runner performance exceeded an in-code regression threshold." >&2
+            exit 1
+          fi
+          exit "$status"
+
+      - name: Run the bootstrap benchmark report
+        if: steps.benchmark-base.outputs.available == 'false'
+        working-directory: apps/runner/Performance
+        run: |
+          swift package benchmark \
+            --target ACIRunnerBenchmarks \
+            --format markdown \
+            --no-progress >> "$GITHUB_STEP_SUMMARY"

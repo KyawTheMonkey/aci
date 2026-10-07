@@ -29,6 +29,7 @@
 
 # Swift Package Manager
 .build/
+.benchmarkBaselines/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .swiftpm/xcode/package.xcworkspace/xcuserdata/
 

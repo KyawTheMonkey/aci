@@ -8,6 +8,7 @@ let package = Package(
     .macOS(.v13)
   ],
   products: [
+    .library(name: "ACIRunnerCore", targets: ["ACIRunnerCore"]),
     .executable(name: "aci-runner", targets: ["runner"])
   ],
   dependencies: [

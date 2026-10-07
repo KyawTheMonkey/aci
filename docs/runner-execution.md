@@ -232,15 +232,18 @@ The iOS acceptance harness additionally verifies:
 Run the strict local verification suite with:
 
 ```bash
-swift test -Xswiftc -warnings-as-errors
-swift build -c release -Xswiftc -warnings-as-errors
+swift test --package-path apps/runner -Xswiftc -warnings-as-errors
+swift build --package-path apps/runner -c release -Xswiftc -warnings-as-errors
+./scripts/benchmark-runner.sh
 ```
 
 The runner package currently targets macOS 13 or later and pins Swift Subprocess through `Package.resolved` for reproducible local builds.
 
+Performance is a tested runner contract. The isolated `apps/runner/Performance` Swift package measures decoding, validation, orchestration, real process launch, and log draining. A separate process probe enforces ceilings for the release binary and peak resident memory. Benchmark dependencies stay out of the production runner package and are not linked into `aci-runner`. See [Runner performance](runner-performance.md) for current measurements and regression thresholds.
+
 ## Next implementation step
 
-Milestone 1 is accepted through the Swift test suite and the repeatable iOS harness. Development now moves to the durable Vapor control plane:
+Milestone 1 is accepted through the Swift test suite, the repeatable iOS harness, and the runner performance guardrails. Development now moves to the durable Vapor control plane:
 
 1. Define the first job, attempt, step, and runner state machines.
 2. Add Fluent models and migrations for those aggregates.

@@ -81,6 +81,8 @@ The initial user is a native iOS developer or small iOS team that:
 - [x] Record step start time, finish time, exit code, and outcome.
 - [x] Implement job timeout and process-tree cancellation.
 - [x] Remove the workspace after success, failure, or cancellation.
+- [x] Benchmark decoding, validation, orchestration, process launch, and log draining.
+- [x] Enforce release executable, minimal-job latency, and resident-memory ceilings.
 
 ### Complete when
 
@@ -99,6 +101,8 @@ Local acceptance command:
 ```
 
 The harness verifies the real checkout and `xcodebuild test` paths. Task cancellation and process-tree teardown remain covered by the runner's deterministic Swift test suite.
+
+Runner changes also execute `./scripts/benchmark-runner.sh`. Pull requests compare high-resolution results with their base commit on the same Mac and enforce absolute release-process guardrails. The benchmark scope and current limits are documented in [Runner Performance](runner-performance.md).
 
 ## Milestone 2 — Durable control plane
 
@@ -272,6 +276,7 @@ The MVP is ready for invited users when all of the following are true:
 - A registered runner cannot claim jobs from an unauthorized pool.
 - Duplicate messages do not create duplicate state transitions.
 - Cancelling a job terminates its complete process tree.
+- Runner changes remain within the reviewed latency, executable-size, and memory budgets.
 - A runner crash produces a clear infrastructure failure or a policy-driven retry.
 - GitHub check state agrees with ACI's terminal state.
 - Secrets remain absent from API responses and test logs.
