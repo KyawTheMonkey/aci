@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Validates and executes all steps in a normalized job sequentially.
 ///
@@ -10,6 +11,7 @@ public struct JobExecutor: Sendable {
   private let workspaceManager: any WorkspaceManaging
   private let commandExecutor: any CommandExecuting
   private let repositoryPreparer: any RepositoryPreparing
+  private let environmentPolicy: ProcessEnvironmentPolicy
 
   /// Creates a job executor with injectable filesystem and process backends.
   ///
@@ -19,13 +21,18 @@ public struct JobExecutor: Sendable {
     validator: JobSpecificationValidator = .init(),
     workspaceManager: any WorkspaceManaging,
     commandExecutor: any CommandExecuting = CommandExecutor(),
-    repositoryPreparer: (any RepositoryPreparing)? = nil
+    repositoryPreparer: (any RepositoryPreparing)? = nil,
+    environmentPolicy: ProcessEnvironmentPolicy = .init()
   ) {
     self.validator = validator
     self.workspaceManager = workspaceManager
     self.commandExecutor = commandExecutor
     self.repositoryPreparer = repositoryPreparer
-      ?? GitRepositoryPreparer(commandExecutor: commandExecutor)
+      ?? GitRepositoryPreparer(
+        commandExecutor: commandExecutor,
+        environmentPolicy: environmentPolicy
+      )
+    self.environmentPolicy = environmentPolicy
   }
 
   /// Executes a job while discarding its streamed log events.
@@ -37,7 +44,8 @@ public struct JobExecutor: Sendable {
   /// - Parameters:
   ///   - specification: The decoded normalized job contract.
   ///   - onLog: An asynchronous consumer for job-wide log events.
-  /// - Returns: A terminal result for every normal execution outcome.
+  /// - Returns: A terminal result for every outcome once a workspace exists,
+  ///   including failures discovered while a later step was being prepared.
   /// - Throws: A validation or workspace error that prevents execution from starting.
   public func execute(
     _ specification: JobSpecification,
@@ -50,13 +58,55 @@ public struct JobExecutor: Sendable {
     let workspace = try workspaceManager.createWorkspace(for: specification.jobID)
     let jobLogSequencer = JobLogSequencer(handler: onLog)
 
-    defer {
-      if specification.workspace.cleanAfterExecution {
-        try? workspaceManager.removeWorkspace(workspace)
+    let execution = await run(
+      specification,
+      in: workspace,
+      deadline: deadline,
+      logSequencer: jobLogSequencer
+    )
+
+    var warnings: [String] = []
+    if specification.workspace.cleanAfterExecution {
+      do {
+        try workspaceManager.removeWorkspace(workspace)
+      } catch {
+        let warning = "Workspace '\(workspace.rootURL.path)' could not be removed: \(error.localizedDescription)"
+        Logger(subsystem: "dev.aci.runner", category: "workspace")
+          .error("\(warning, privacy: .public)")
+        warnings.append(warning)
       }
     }
 
+    return JobResult(
+      jobID: specification.jobID,
+      outcome: execution.outcome,
+      stepResults: execution.stepResults,
+      startedAt: jobStartedAt,
+      finishedAt: Date(),
+      failureReason: execution.failureReason,
+      warnings: warnings
+    )
+  }
+
+  /// Runs checkout and steps, converting every failure into a terminal result.
+  private func run(
+    _ specification: JobSpecification,
+    in workspace: Workspace,
+    deadline: Date,
+    logSequencer: JobLogSequencer
+  ) async -> Execution {
     var stepResults: [StepResult] = []
+
+    let baseEnvironment: [String: String]
+    do {
+      baseEnvironment = try makeBaseEnvironment(for: specification, in: workspace)
+    } catch {
+      return Execution(
+        outcome: .infrastructureFailed,
+        stepResults: stepResults,
+        failureReason: "Runner could not prepare the job environment: \(error.localizedDescription)"
+      )
+    }
 
     if let repository = specification.repository {
       let checkoutStartedAt = Date()
@@ -67,7 +117,7 @@ public struct JobExecutor: Sendable {
           in: workspace,
           deadline: deadline,
           onLog: { event in
-            await jobLogSequencer.forward(event)
+            await logSequencer.forward(event)
           }
         )
         stepResults.append(
@@ -87,17 +137,16 @@ public struct JobExecutor: Sendable {
             stepID: GitRepositoryPreparer.stepID,
             outcome: failure.outcome,
             exitCode: failure.exitCode,
+            terminationReason: failure.terminationReason,
             startedAt: checkoutStartedAt,
             finishedAt: Date(),
             failureReason: error.localizedDescription
           )
         )
 
-        return makeJobResult(
-          specification: specification,
+        return Execution(
           outcome: failure.outcome,
           stepResults: stepResults,
-          startedAt: jobStartedAt,
           failureReason: "Repository checkout failed: \(error.localizedDescription)"
         )
       } catch is CancellationError {
@@ -112,11 +161,9 @@ public struct JobExecutor: Sendable {
           )
         )
 
-        return makeJobResult(
-          specification: specification,
+        return Execution(
           outcome: .cancelled,
           stepResults: stepResults,
-          startedAt: jobStartedAt,
           failureReason: "Repository checkout was cancelled."
         )
       } catch {
@@ -131,11 +178,9 @@ public struct JobExecutor: Sendable {
           )
         )
 
-        return makeJobResult(
-          specification: specification,
+        return Execution(
           outcome: .infrastructureFailed,
           stepResults: stepResults,
-          startedAt: jobStartedAt,
           failureReason: "Runner could not prepare the repository: \(error.localizedDescription)"
         )
       }
@@ -143,35 +188,56 @@ public struct JobExecutor: Sendable {
 
     for step in specification.steps {
       if Task.isCancelled {
-        return makeJobResult(
-          specification: specification,
+        return Execution(
           outcome: .cancelled,
           stepResults: stepResults,
-          startedAt: jobStartedAt,
           failureReason: "Job execution was cancelled."
         )
       }
 
       let remainingJobSeconds = Int(ceil(deadline.timeIntervalSinceNow))
       guard remainingJobSeconds > 0 else {
-        return makeJobResult(
-          specification: specification,
+        return Execution(
           outcome: .timedOut,
           stepResults: stepResults,
-          startedAt: jobStartedAt,
           failureReason: "Job timeout was reached before step '\(step.id)' started."
         )
       }
 
+      let stepStartedAt = Date()
+
+      // A previous step may have replaced a workspace path with a symbolic
+      // link that points outside the workspace. That is a failure of this
+      // step, not of the runner, and earlier step results must survive it.
       let workingDirectory: URL
-      if let relativeDirectory = step.workingDirectory, relativeDirectory != "." {
-        workingDirectory = try workspaceManager.resolve(relativeDirectory, in: workspace)
-      } else {
-        workingDirectory = workspace.rootURL
+      do {
+        if let relativeDirectory = step.workingDirectory, relativeDirectory != "." {
+          workingDirectory = try workspaceManager.resolve(relativeDirectory, in: workspace)
+        } else {
+          workingDirectory = workspace.rootURL
+        }
+      } catch {
+        let reason = "Working directory could not be resolved: \(error.localizedDescription)"
+        stepResults.append(
+          StepResult(
+            stepID: step.id,
+            outcome: .failed,
+            exitCode: nil,
+            startedAt: stepStartedAt,
+            finishedAt: Date(),
+            failureReason: reason
+          )
+        )
+
+        return Execution(
+          outcome: .failed,
+          stepResults: stepResults,
+          failureReason: "Step '\(step.id)' failed: \(reason)"
+        )
       }
 
-      var environment = ProcessInfo.processInfo.environment
-      environment.merge(step.environment) { _, jobValue in jobValue }
+      var environment = baseEnvironment
+      environment.merge(step.environment) { _, stepValue in stepValue }
 
       let command = Command(
         executableURL: URL(fileURLWithPath: step.executable).standardizedFileURL,
@@ -182,7 +248,6 @@ public struct JobExecutor: Sendable {
       // A step can request a shorter deadline but can never extend the time
       // remaining on the enclosing job.
       let effectiveTimeout = min(step.timeoutSeconds ?? remainingJobSeconds, remainingJobSeconds)
-      let stepStartedAt = Date()
 
       do {
         let commandResult = try await commandExecutor.execute(
@@ -190,7 +255,7 @@ public struct JobExecutor: Sendable {
           stepID: step.id,
           timeoutSeconds: effectiveTimeout,
           onLog: { event in
-            await jobLogSequencer.forward(event)
+            await logSequencer.forward(event)
           }
         )
         let outcome = executionOutcome(for: commandResult.outcome)
@@ -199,6 +264,7 @@ public struct JobExecutor: Sendable {
           stepID: step.id,
           outcome: outcome,
           exitCode: commandResult.exitCode,
+          terminationReason: commandResult.terminationReason,
           startedAt: commandResult.startedAt,
           finishedAt: commandResult.finishedAt,
           failureReason: failureReason
@@ -211,32 +277,50 @@ public struct JobExecutor: Sendable {
         case .failed where step.continueOnError:
           continue
         case .failed:
-          return makeJobResult(
-            specification: specification,
+          return Execution(
             outcome: .failed,
             stepResults: stepResults,
-            startedAt: jobStartedAt,
-            failureReason: "Step '\(step.id)' exited with code \(commandResult.exitCode)."
+            failureReason: "Step '\(step.id)' \(terminationDescription(for: commandResult))."
           )
         case .timedOut:
-          return makeJobResult(
-            specification: specification,
+          return Execution(
             outcome: .timedOut,
             stepResults: stepResults,
-            startedAt: jobStartedAt,
             failureReason: "Step '\(step.id)' timed out."
           )
         case .cancelled:
-          return makeJobResult(
-            specification: specification,
+          return Execution(
             outcome: .cancelled,
             stepResults: stepResults,
-            startedAt: jobStartedAt,
             failureReason: "Step '\(step.id)' was cancelled."
           )
         case .infrastructureFailed:
           assertionFailure("Command execution cannot directly return an infrastructure failure.")
         }
+      } catch let error as CommandExecutionError where isUserLaunchFailure(error) {
+        // The job named an executable or directory that does not exist on
+        // this runner. Retrying elsewhere cannot fix a workflow mistake, so
+        // this is a step failure rather than an infrastructure failure.
+        stepResults.append(
+          StepResult(
+            stepID: step.id,
+            outcome: .failed,
+            exitCode: nil,
+            startedAt: stepStartedAt,
+            finishedAt: Date(),
+            failureReason: error.localizedDescription
+          )
+        )
+
+        if step.continueOnError {
+          continue
+        }
+
+        return Execution(
+          outcome: .failed,
+          stepResults: stepResults,
+          failureReason: "Step '\(step.id)' failed: \(error.localizedDescription)"
+        )
       } catch {
         stepResults.append(
           StepResult(
@@ -249,23 +333,54 @@ public struct JobExecutor: Sendable {
           )
         )
 
-        return makeJobResult(
-          specification: specification,
+        return Execution(
           outcome: .infrastructureFailed,
           stepResults: stepResults,
-          startedAt: jobStartedAt,
           failureReason: "Runner failed to execute step '\(step.id)': \(error.localizedDescription)"
         )
       }
     }
 
-    return makeJobResult(
-      specification: specification,
-      outcome: .succeeded,
-      stepResults: stepResults,
-      startedAt: jobStartedAt,
-      failureReason: nil
+    return Execution(outcome: .succeeded, stepResults: stepResults, failureReason: nil)
+  }
+
+  /// Builds the environment shared by every step before step overrides apply.
+  ///
+  /// The job receives an allowlisted copy of the runner environment, the ACI
+  /// job variables, and a `TMPDIR` inside the workspace so temporary files
+  /// disappear with the job instead of accumulating in the user's temp folder.
+  private func makeBaseEnvironment(
+    for specification: JobSpecification,
+    in workspace: Workspace
+  ) throws -> [String: String] {
+    let temporaryDirectory = workspace.rootURL
+      .appendingPathComponent(".aci", isDirectory: true)
+      .appendingPathComponent("tmp", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: temporaryDirectory,
+      withIntermediateDirectories: true
     )
+
+    var environment = environmentPolicy.environment()
+    environment[JobEnvironment.ci] = "true"
+    environment[JobEnvironment.aci] = "true"
+    environment[JobEnvironment.jobID] = specification.jobID.uuidString.lowercased()
+    environment[JobEnvironment.workspace] = workspace.rootURL.path
+    environment[JobEnvironment.temporaryDirectory] = temporaryDirectory.path
+    environment["TMPDIR"] = temporaryDirectory.path
+    if let repository = specification.repository {
+      environment[JobEnvironment.commitSHA] = repository.commitSHA
+    }
+    return environment
+  }
+
+  private func isUserLaunchFailure(_ error: CommandExecutionError) -> Bool {
+    switch error {
+    case .executableUnavailable, .workingDirectoryUnavailable:
+      true
+    case .invalidTimeout, .launchFailed:
+      false
+    }
   }
 
   private func executionOutcome(for commandOutcome: CommandOutcome) -> ExecutionOutcome {
@@ -286,33 +401,30 @@ public struct JobExecutor: Sendable {
     }
   }
 
-  private func repositoryFailure(
-    from error: RepositoryPreparationError
-  ) -> (outcome: ExecutionOutcome, exitCode: Int32?) {
-    switch error {
-    case .deadlineExceeded:
-      (.timedOut, nil)
-    case let .commandFailed(_, result):
-      (executionOutcome(for: result.outcome), result.exitCode)
+  private func terminationDescription(for result: CommandExecutionResult) -> String {
+    switch result.terminationReason {
+    case .exit: "exited with code \(result.exitCode)"
+    case .uncaughtSignal: "was terminated by signal \(result.exitCode)"
     }
   }
 
-  private func makeJobResult(
-    specification: JobSpecification,
-    outcome: ExecutionOutcome,
-    stepResults: [StepResult],
-    startedAt: Date,
-    failureReason: String?
-  ) -> JobResult {
-    JobResult(
-      jobID: specification.jobID,
-      outcome: outcome,
-      stepResults: stepResults,
-      startedAt: startedAt,
-      finishedAt: Date(),
-      failureReason: failureReason
-    )
+  private func repositoryFailure(
+    from error: RepositoryPreparationError
+  ) -> (outcome: ExecutionOutcome, exitCode: Int32?, terminationReason: CommandTerminationReason?) {
+    switch error {
+    case .deadlineExceeded:
+      (.timedOut, nil, nil)
+    case let .commandFailed(_, result):
+      (executionOutcome(for: result.outcome), result.exitCode, result.terminationReason)
+    }
   }
+}
+
+/// The outcome of orchestration before workspace cleanup runs.
+private struct Execution {
+  let outcome: ExecutionOutcome
+  let stepResults: [StepResult]
+  let failureReason: String?
 }
 
 private actor JobLogSequencer {
