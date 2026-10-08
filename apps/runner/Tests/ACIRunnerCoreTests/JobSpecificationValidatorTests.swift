@@ -105,6 +105,51 @@ struct JobSpecificationValidatorTests {
     )
   }
 
+  @Test("Tilde-prefixed executables are not absolute", arguments: ["~/bin/tool", "~runner/bin/tool"])
+  func tildeExecutables(path: String) {
+    expectValidationError(
+      .nonAbsoluteExecutable(stepID: "test", path: path),
+      for: makeJob(steps: [makeStep(executable: path)])
+    )
+  }
+
+  @Test("Step names are bounded")
+  func stepNameLength() {
+    let name = String(repeating: "n", count: 257)
+    expectValidationError(
+      .stepNameTooLong(stepID: "test", received: 257, maximum: 256),
+      for: makeJob(steps: [makeStep(name: name)])
+    )
+  }
+
+  @Test("Arguments and environment values cannot contain null bytes")
+  func nullBytes() {
+    expectValidationError(
+      .invalidArgument(stepID: "test", index: 1),
+      for: makeJob(steps: [makeStep(arguments: ["ok", "bad\u{0}"])])
+    )
+    expectValidationError(
+      .invalidEnvironmentValue(stepID: "test", name: "TOKEN"),
+      for: makeJob(steps: [makeStep(environment: ["TOKEN": "bad\u{0}"])])
+    )
+  }
+
+  @Test("Oversized commands are rejected before spawn")
+  func commandSize() {
+    let limitedValidator = JobSpecificationValidator(
+      limits: JobSpecificationValidationLimits(maximumCommandBytes: 64)
+    )
+    let step = makeStep(arguments: [String(repeating: "a", count: 64)])
+
+    // "/usr/bin/true" plus its terminator is 14 bytes; the argument adds 65.
+    #expect(throws: JobSpecificationError.commandTooLarge(stepID: "test", received: 79, maximum: 64)) {
+      try limitedValidator.validate(makeJob(steps: [step]))
+    }
+    #expect(throws: Never.self) {
+      try validator.validate(makeJob(steps: [step]))
+    }
+  }
+
   @Test("A job requires at least one step")
   func noSteps() {
     expectValidationError(.noSteps, for: makeJob(steps: []))

@@ -18,6 +18,12 @@ public struct JobSpecificationValidationLimits: Sendable, Equatable {
   public let maximumIdentifierLength: Int
   /// The largest accepted executable, working-directory, or artifact path.
   public let maximumPathLength: Int
+  /// The largest accepted step display name.
+  public let maximumNameLength: Int
+  /// The largest combined size of one step's executable, arguments, and
+  /// environment. The kernel rejects anything near `ARG_MAX` at spawn time;
+  /// rejecting it here reports a malformed job instead of a runner fault.
+  public let maximumCommandBytes: Int
   /// Whether local `file://` repositories are accepted for offline testing.
   public let allowsFileRepositoryURLs: Bool
 
@@ -29,6 +35,8 @@ public struct JobSpecificationValidationLimits: Sendable, Equatable {
     maximumStepCount: Int = 100,
     maximumIdentifierLength: Int = 128,
     maximumPathLength: Int = 4_096,
+    maximumNameLength: Int = 256,
+    maximumCommandBytes: Int = 262_144,
     allowsFileRepositoryURLs: Bool = false
   ) {
     self.supportedVersion = supportedVersion
@@ -37,6 +45,8 @@ public struct JobSpecificationValidationLimits: Sendable, Equatable {
     self.maximumStepCount = maximumStepCount
     self.maximumIdentifierLength = maximumIdentifierLength
     self.maximumPathLength = maximumPathLength
+    self.maximumNameLength = maximumNameLength
+    self.maximumCommandBytes = maximumCommandBytes
     self.allowsFileRepositoryURLs = allowsFileRepositoryURLs
   }
 }
@@ -57,6 +67,10 @@ public enum JobSpecificationError: LocalizedError, Sendable, Equatable {
   case invalidStepID(index: Int, id: String)
   case duplicateStepID(String)
   case emptyStepName(stepID: String)
+  case stepNameTooLong(stepID: String, received: Int, maximum: Int)
+  case invalidArgument(stepID: String, index: Int)
+  case invalidEnvironmentValue(stepID: String, name: String)
+  case commandTooLarge(stepID: String, received: Int, maximum: Int)
   case invalidStepTimeout(stepID: String, received: Int, maximum: Int)
   case stepTimeoutExceedsJobTimeout(stepID: String)
   case nonAbsoluteExecutable(stepID: String, path: String)
@@ -91,6 +105,14 @@ public enum JobSpecificationError: LocalizedError, Sendable, Equatable {
       "Step identifier '\(id)' is duplicated."
     case let .emptyStepName(stepID):
       "Step '\(stepID)' has an empty display name."
+    case let .stepNameTooLong(stepID, received, maximum):
+      "Step '\(stepID)' display name may contain at most \(maximum) characters; received \(received)."
+    case let .invalidArgument(stepID, index):
+      "Step '\(stepID)' argument at index \(index) contains a null byte."
+    case let .invalidEnvironmentValue(stepID, name):
+      "Step '\(stepID)' environment variable '\(name)' contains a null byte."
+    case let .commandTooLarge(stepID, received, maximum):
+      "Step '\(stepID)' command may use at most \(maximum) bytes of arguments and environment; received \(received)."
     case let .invalidStepTimeout(stepID, received, maximum):
       "Step '\(stepID)' timeout must be between 1 and \(maximum) seconds; received \(received)."
     case let .stepTimeoutExceedsJobTimeout(stepID):
@@ -246,6 +268,14 @@ public struct JobSpecificationValidator: Sendable {
         throw JobSpecificationError.emptyStepName(stepID: step.id)
       }
 
+      guard step.name.count <= limits.maximumNameLength else {
+        throw JobSpecificationError.stepNameTooLong(
+          stepID: step.id,
+          received: step.name.count,
+          maximum: limits.maximumNameLength
+        )
+      }
+
       if let timeout = step.timeoutSeconds {
         guard (1...limits.maximumStepTimeoutSeconds).contains(timeout) else {
           throw JobSpecificationError.invalidStepTimeout(
@@ -271,15 +301,28 @@ public struct JobSpecificationValidator: Sendable {
         )
       }
 
-      for name in step.environment.keys where !isValidEnvironmentVariableName(name) {
-        throw JobSpecificationError.invalidEnvironmentVariable(stepID: step.id, name: name)
+      for (index, argument) in step.arguments.enumerated() where argument.containsNullByte {
+        throw JobSpecificationError.invalidArgument(stepID: step.id, index: index)
       }
+
+      for (name, value) in step.environment {
+        guard isValidEnvironmentVariableName(name) else {
+          throw JobSpecificationError.invalidEnvironmentVariable(stepID: step.id, name: name)
+        }
+        guard !value.containsNullByte else {
+          throw JobSpecificationError.invalidEnvironmentValue(stepID: step.id, name: name)
+        }
+      }
+
+      try validateCommandSize(of: step)
     }
   }
 
   private func validateExecutable(_ path: String, stepID: String) throws {
+    // `NSString.isAbsolutePath` also accepts `~` and `~user` prefixes, which
+    // would resolve relative to the runner account or its working directory.
     guard path.count <= limits.maximumPathLength,
-          NSString(string: path).isAbsolutePath
+          path.hasPrefix("/")
     else {
       throw JobSpecificationError.nonAbsoluteExecutable(stepID: stepID, path: path)
     }
@@ -287,6 +330,27 @@ public struct JobSpecificationValidator: Sendable {
     let components = NSString(string: path).pathComponents
     guard !components.contains(".."), !path.containsNullByte else {
       throw JobSpecificationError.ambiguousExecutable(stepID: stepID, path: path)
+    }
+  }
+
+  /// Counts the bytes `posix_spawn` must copy for the argument and environment
+  /// vectors, including each entry's terminating null byte and the `=` that
+  /// joins environment names to values.
+  private func validateCommandSize(of step: StepSpecification) throws {
+    var bytes = step.executable.utf8.count + 1
+    for argument in step.arguments {
+      bytes += argument.utf8.count + 1
+    }
+    for (name, value) in step.environment {
+      bytes += name.utf8.count + value.utf8.count + 2
+    }
+
+    guard bytes <= limits.maximumCommandBytes else {
+      throw JobSpecificationError.commandTooLarge(
+        stepID: step.id,
+        received: bytes,
+        maximum: limits.maximumCommandBytes
+      )
     }
   }
 
