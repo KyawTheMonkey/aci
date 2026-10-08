@@ -64,6 +64,66 @@ struct GitRepositoryPreparerTests {
     }
   }
 
+  @Test("Retries transient fetch failures and then checks out")
+  func retriesTransientFetchFailures() async throws {
+    let success = makeCommandResult(outcome: .succeeded, exitCode: 0)
+    let transient = makeCommandResult(outcome: .failed, exitCode: 128)
+    let commandExecutor = ScriptedCommandExecutor(responses: [
+      .result(success),
+      .result(transient, stderr: "fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host\n"),
+      .result(transient, stderr: "error: RPC failed; curl 56 Recv failure\n"),
+      .result(success),
+      .result(success),
+    ])
+    let preparer = GitRepositoryPreparer(
+      commandExecutor: commandExecutor,
+      fetchRetryDelays: [.zero, .zero]
+    )
+    let collector = LogCollector()
+
+    try await preparer.prepare(
+      makeRepository(),
+      in: Workspace(rootURL: FileManager.default.temporaryDirectory),
+      deadline: Date().addingTimeInterval(60),
+      onLog: { event in await collector.append(event) }
+    )
+
+    let subcommands = await commandExecutor.commands.map { command in
+      command.arguments.first { !$0.hasPrefix("-") && !$0.contains("=") } ?? ""
+    }
+    #expect(subcommands == ["init", "fetch", "fetch", "fetch", "checkout"])
+    let retryNotices = await collector.events.filter { $0.text.contains("retrying") }
+    #expect(retryNotices.count == 2)
+    #expect(await commandExecutor.commands.allSatisfy { $0.environment["GIT_TERMINAL_PROMPT"] == "0" })
+  }
+
+  @Test("Does not retry fetches that can never succeed")
+  func doesNotRetryPermanentFailures() async throws {
+    let commandExecutor = ScriptedCommandExecutor(responses: [
+      .result(makeCommandResult(outcome: .succeeded, exitCode: 0)),
+      .result(
+        makeCommandResult(outcome: .failed, exitCode: 128),
+        stderr: "fatal: remote error: upload-pack: not our ref ffff\n"
+      ),
+      .result(makeCommandResult(outcome: .succeeded, exitCode: 0)),
+    ])
+    let preparer = GitRepositoryPreparer(
+      commandExecutor: commandExecutor,
+      fetchRetryDelays: [.zero, .zero]
+    )
+
+    await #expect(throws: RepositoryPreparationError.self) {
+      try await preparer.prepare(
+        makeRepository(),
+        in: Workspace(rootURL: FileManager.default.temporaryDirectory),
+        deadline: Date().addingTimeInterval(60),
+        onLog: { _ in }
+      )
+    }
+
+    #expect(await commandExecutor.commands.count == 2)
+  }
+
   @Test("Does not launch Git after the job deadline")
   func respectsJobDeadline() async throws {
     let base = try makeTemporaryDirectory()
@@ -82,6 +142,14 @@ struct GitRepositoryPreparerTests {
     }
 
     #expect(!FileManager.default.fileExists(atPath: base.appendingPathComponent(".git").path))
+  }
+}
+
+private actor LogCollector {
+  private(set) var events: [LogEvent] = []
+
+  func append(_ event: LogEvent) {
+    events.append(event)
   }
 }
 

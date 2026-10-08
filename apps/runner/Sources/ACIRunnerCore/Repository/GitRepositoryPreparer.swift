@@ -58,20 +58,34 @@ public protocol RepositoryPreparing: Sendable {
 /// Git receives a complete commit SHA rather than a branch or tag. Global and
 /// system configuration are disabled so host aliases, hooks, and credential
 /// helpers cannot silently change checkout behavior.
+///
+/// Fetching is the only network operation, so it is the only stage that is
+/// retried. Transient transport failures are retried with a short backoff;
+/// failures that cannot succeed on retry, such as an unknown commit or a
+/// rejected credential, fail immediately.
 public struct GitRepositoryPreparer: RepositoryPreparing, Sendable {
   /// The synthetic step identifier used for checkout logs and results.
   public static let stepID = RepositorySpecification.checkoutStepID
 
+  /// The pause before each fetch retry; the count bounds the number of retries.
+  public static let defaultFetchRetryDelays: [Duration] = [.seconds(2), .seconds(5)]
+
   private let commandExecutor: any CommandExecuting
   private let gitExecutableURL: URL
+  private let environmentPolicy: ProcessEnvironmentPolicy
+  private let fetchRetryDelays: [Duration]
 
   /// Creates a Git-backed repository preparer.
   public init(
     commandExecutor: any CommandExecuting = CommandExecutor(),
-    gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git")
+    gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git"),
+    environmentPolicy: ProcessEnvironmentPolicy = .init(),
+    fetchRetryDelays: [Duration] = GitRepositoryPreparer.defaultFetchRetryDelays
   ) {
     self.commandExecutor = commandExecutor
     self.gitExecutableURL = gitExecutableURL
+    self.environmentPolicy = environmentPolicy
+    self.fetchRetryDelays = fetchRetryDelays
   }
 
   public func prepare(
@@ -80,11 +94,14 @@ public struct GitRepositoryPreparer: RepositoryPreparing, Sendable {
     deadline: Date,
     onLog: @escaping LogHandler
   ) async throws {
-    let invocations = [
-      GitInvocation(
-        stage: .initialize,
-        arguments: ["init", "--quiet", "."]
-      ),
+    try await runOnce(
+      GitInvocation(stage: .initialize, arguments: ["init", "--quiet", "."]),
+      in: workspace,
+      deadline: deadline,
+      onLog: onLog
+    )
+
+    try await fetchWithRetries(
       GitInvocation(
         stage: .fetch,
         arguments: [
@@ -97,6 +114,12 @@ public struct GitRepositoryPreparer: RepositoryPreparing, Sendable {
           repository.commitSHA,
         ]
       ),
+      in: workspace,
+      deadline: deadline,
+      onLog: onLog
+    )
+
+    try await runOnce(
       GitInvocation(
         stage: .checkout,
         arguments: [
@@ -107,34 +130,128 @@ public struct GitRepositoryPreparer: RepositoryPreparing, Sendable {
           repository.commitSHA,
         ]
       ),
-    ]
+      in: workspace,
+      deadline: deadline,
+      onLog: onLog
+    )
+  }
 
-    for invocation in invocations {
-      try Task.checkCancellation()
-
-      let remainingSeconds = Int(ceil(deadline.timeIntervalSinceNow))
-      guard remainingSeconds > 0 else {
-        throw RepositoryPreparationError.deadlineExceeded(stage: invocation.stage)
-      }
-
-      let result = try await commandExecutor.execute(
-        makeCommand(arguments: invocation.arguments, workspace: workspace),
-        stepID: Self.stepID,
-        timeoutSeconds: remainingSeconds,
-        onLog: onLog
-      )
-
-      guard result.outcome == .succeeded else {
-        throw RepositoryPreparationError.commandFailed(
-          stage: invocation.stage,
-          result: result
-        )
-      }
+  private func runOnce(
+    _ invocation: GitInvocation,
+    in workspace: Workspace,
+    deadline: Date,
+    onLog: @escaping LogHandler
+  ) async throws {
+    let result = try await run(invocation, in: workspace, deadline: deadline, onLog: onLog)
+    guard result.outcome == .succeeded else {
+      throw RepositoryPreparationError.commandFailed(stage: invocation.stage, result: result)
     }
   }
 
+  private func fetchWithRetries(
+    _ invocation: GitInvocation,
+    in workspace: Workspace,
+    deadline: Date,
+    onLog: @escaping LogHandler
+  ) async throws {
+    var attempt = 0
+
+    while true {
+      let diagnostics = StandardErrorCollector()
+      let result = try await run(
+        invocation,
+        in: workspace,
+        deadline: deadline,
+        onLog: { event in
+          if event.stream == .stderr {
+            await diagnostics.append(event.text)
+          }
+          await onLog(event)
+        }
+      )
+
+      if result.outcome == .succeeded {
+        return
+      }
+
+      let failure = RepositoryPreparationError.commandFailed(stage: invocation.stage, result: result)
+      guard result.outcome == .failed,
+            attempt < fetchRetryDelays.count,
+            isRetryable(await diagnostics.text)
+      else {
+        throw failure
+      }
+
+      let delay = fetchRetryDelays[attempt]
+      attempt += 1
+
+      // Do not start a wait that would consume the time a retry needs.
+      let delaySeconds = TimeInterval(delay.components.seconds)
+      guard deadline.timeIntervalSinceNow > delaySeconds + 1 else {
+        throw failure
+      }
+
+      await onLog(
+        LogEvent(
+          sequence: 0,
+          stepID: Self.stepID,
+          stream: .stderr,
+          timestamp: Date(),
+          text: "aci-runner: fetch failed with a transient error; retrying in \(Int(delaySeconds))s "
+            + "(retry \(attempt) of \(fetchRetryDelays.count)).\n"
+        )
+      )
+      try await Task.sleep(for: delay)
+    }
+  }
+
+  private func run(
+    _ invocation: GitInvocation,
+    in workspace: Workspace,
+    deadline: Date,
+    onLog: @escaping LogHandler
+  ) async throws -> CommandExecutionResult {
+    try Task.checkCancellation()
+
+    let remainingSeconds = Int(ceil(deadline.timeIntervalSinceNow))
+    guard remainingSeconds > 0 else {
+      throw RepositoryPreparationError.deadlineExceeded(stage: invocation.stage)
+    }
+
+    return try await commandExecutor.execute(
+      makeCommand(arguments: invocation.arguments, workspace: workspace),
+      stepID: Self.stepID,
+      timeoutSeconds: remainingSeconds,
+      onLog: onLog
+    )
+  }
+
+  /// Decides whether a failed fetch could succeed if repeated.
+  ///
+  /// Git reports permanent conditions with recognizable phrases. Anything
+  /// else, such as a connection reset, a timeout, or a 5xx response, is
+  /// treated as transient.
+  private func isRetryable(_ standardError: String) -> Bool {
+    let diagnostic = standardError.lowercased()
+    let permanentFailures = [
+      "not our ref",
+      "couldn't find remote ref",
+      "not a valid object name",
+      "unadvertised object",
+      "does not appear to be a git repository",
+      "repository not found",
+      "authentication failed",
+      "could not read username",
+      "could not read password",
+      "permission denied",
+      "invalid username or password",
+      "terminal prompts disabled",
+    ]
+    return !permanentFailures.contains { diagnostic.contains($0) }
+  }
+
   private func makeCommand(arguments: [String], workspace: Workspace) -> Command {
-    var environment = ProcessInfo.processInfo.environment
+    var environment = environmentPolicy.environment()
     for key in Array(environment.keys) where key.hasPrefix("GIT_") {
       environment.removeValue(forKey: key)
     }
@@ -144,9 +261,20 @@ public struct GitRepositoryPreparer: RepositoryPreparing, Sendable {
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["LC_ALL"] = "C"
 
+    // Per-invocation configuration keeps checkout deterministic: no background
+    // maintenance, no filesystem monitor daemon, and no implicit submodule
+    // traffic. Protocol v2 is required to fetch an unadvertised commit by SHA.
+    let configuration = [
+      "protocol.version=2",
+      "gc.auto=0",
+      "core.fsmonitor=false",
+      "fetch.recurseSubmodules=no",
+      "advice.detachedHead=false",
+    ].flatMap { ["-c", $0] }
+
     return Command(
       executableURL: gitExecutableURL,
-      arguments: arguments,
+      arguments: configuration + arguments,
       environment: environment,
       workingDirectoryURL: workspace.rootURL
     )
@@ -156,6 +284,14 @@ public struct GitRepositoryPreparer: RepositoryPreparing, Sendable {
 private struct GitInvocation {
   let stage: RepositoryPreparationStage
   let arguments: [String]
+}
+
+private actor StandardErrorCollector {
+  private(set) var text = ""
+
+  func append(_ chunk: String) {
+    text.append(chunk)
+  }
 }
 
 private extension RepositoryPreparationStage {

@@ -59,6 +59,57 @@ func makeTemporaryDirectory(named name: String = UUID().uuidString) throws -> UR
   return url
 }
 
+/// One scripted answer from ``ScriptedCommandExecutor``.
+enum ScriptedResponse: Sendable {
+  /// Return this result after optionally emitting stderr text and waiting.
+  case result(CommandExecutionResult, stderr: String = "", delay: Duration = .zero)
+  /// Throw this error instead of returning a result.
+  case failure(CommandExecutionError)
+}
+
+/// A process backend that replays scripted responses and records every command.
+actor ScriptedCommandExecutor: CommandExecuting {
+  private var responses: [ScriptedResponse]
+  private(set) var commands: [Command] = []
+  private(set) var stepIDs: [String] = []
+
+  init(responses: [ScriptedResponse]) {
+    self.responses = responses
+  }
+
+  func execute(
+    _ command: Command,
+    stepID: String,
+    timeoutSeconds: Int,
+    onLog: @escaping LogHandler
+  ) async throws -> CommandExecutionResult {
+    commands.append(command)
+    stepIDs.append(stepID)
+
+    guard !responses.isEmpty else {
+      throw CommandExecutionError.launchFailed(
+        executable: command.executableURL.path,
+        reason: "No scripted response remains."
+      )
+    }
+
+    switch responses.removeFirst() {
+    case let .result(result, stderr, delay):
+      if !stderr.isEmpty {
+        await onLog(
+          LogEvent(sequence: 0, stepID: stepID, stream: .stderr, timestamp: Date(), text: stderr)
+        )
+      }
+      if delay > .zero {
+        try await Task.sleep(for: delay)
+      }
+      return result
+    case let .failure(error):
+      throw error
+    }
+  }
+}
+
 func makeCommandResult(
   outcome: CommandOutcome,
   exitCode: Int32
