@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Inspects the local Mac and produces scheduler-facing runner capabilities.
@@ -6,28 +7,51 @@ import Foundation
 /// a valid runner host; it simply advertises no Xcode or simulator capability.
 public struct CapabilityDetector: Sendable {
   private let commandExecutor: any CommandExecuting
+  private let environmentPolicy: ProcessEnvironmentPolicy
+  private let storageURL: URL
 
   /// Creates a detector using the supplied process backend.
-  public init(commandExecutor: any CommandExecuting = CommandExecutor()) {
+  /// - Parameters:
+  ///   - commandExecutor: The backend used for toolchain probes.
+  ///   - environmentPolicy: The environment handed to probe processes.
+  ///   - storageURL: A location on the volume where job workspaces live. The
+  ///     path does not need to exist yet; the nearest existing ancestor is
+  ///     measured.
+  public init(
+    commandExecutor: any CommandExecuting = CommandExecutor(),
+    environmentPolicy: ProcessEnvironmentPolicy = .init(),
+    storageURL: URL = FileManager.default.homeDirectoryForCurrentUser
+  ) {
     self.commandExecutor = commandExecutor
+    self.environmentPolicy = environmentPolicy
+    self.storageURL = storageURL
   }
 
-  /// Detects host, storage, Xcode, and simulator capabilities concurrently.
+  /// Detects host, storage, Xcode, and simulator capabilities.
+  ///
+  /// `xcodebuild` and `xcrun` are shims that open a graphical "install the
+  /// command line tools" prompt on a Mac without a developer directory, so they
+  /// are only invoked after `xcode-select` confirms one exists.
   public func detect() async -> RunnerCapabilities {
-    async let xcodePath = capture(
+    let xcodePath = await capture(
       executable: "/usr/bin/xcode-select",
       arguments: ["--print-path"]
-    )
-    async let xcodeVersion = capture(
-      executable: "/usr/bin/xcodebuild",
-      arguments: ["-version"]
-    )
-    async let runtimesJSON = capture(
-      executable: "/usr/bin/xcrun",
-      arguments: ["simctl", "list", "runtimes", "--json"]
-    )
+    )?.trimmedNonempty
 
-    let runtimeOutput = await runtimesJSON
+    var xcodeVersion: String?
+    var simulatorRuntimes: [String] = []
+    if xcodePath != nil {
+      async let version = capture(
+        executable: "/usr/bin/xcodebuild",
+        arguments: ["-version"]
+      )
+      async let runtimesJSON = capture(
+        executable: "/usr/bin/xcrun",
+        arguments: ["simctl", "list", "runtimes", "--json"]
+      )
+      xcodeVersion = await version?.trimmedNonempty
+      simulatorRuntimes = decodeRuntimeNames(from: await runtimesJSON)
+    }
 
     return RunnerCapabilities(
       runnerVersion: ACIRunnerVersion.current,
@@ -35,10 +59,10 @@ public struct CapabilityDetector: Sendable {
       operatingSystem: "macos",
       operatingSystemVersion: operatingSystemVersion,
       architecture: architecture,
-      hostname: ProcessInfo.processInfo.hostName,
-      xcodePath: await xcodePath?.trimmedNonempty,
-      xcodeVersion: await xcodeVersion?.trimmedNonempty,
-      simulatorRuntimes: decodeRuntimeNames(from: runtimeOutput),
+      hostname: hostname,
+      xcodePath: xcodePath,
+      xcodeVersion: xcodeVersion,
+      simulatorRuntimes: simulatorRuntimes,
       availableDiskBytes: availableDiskBytes,
       maximumConcurrency: 1,
       labels: ["self-hosted", "macos", architecture]
@@ -60,15 +84,45 @@ public struct CapabilityDetector: Sendable {
     #endif
   }
 
+  /// The kernel host name.
+  ///
+  /// `ProcessInfo.hostName` performs a reverse DNS lookup that can stall for
+  /// seconds on a misconfigured network; `gethostname` does not.
+  private var hostname: String {
+    var buffer = [UInt8](repeating: 0, count: Int(MAXHOSTNAMELEN) + 1)
+    let status = buffer.withUnsafeMutableBufferPointer { pointer in
+      pointer.withMemoryRebound(to: CChar.self) { characters in
+        gethostname(characters.baseAddress, characters.count - 1)
+      }
+    }
+    guard status == 0 else {
+      return "localhost"
+    }
+    return String(decoding: buffer.prefix { $0 != 0 }, as: UTF8.self)
+  }
+
+  /// Space a job may actually use on the workspace volume.
+  ///
+  /// APFS reports purgeable space as used, so `systemFreeSize` undercounts;
+  /// the "important usage" capacity is the figure Finder shows and the one a
+  /// scheduler should trust.
   private var availableDiskBytes: Int64? {
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    guard let attributes = try? FileManager.default.attributesOfFileSystem(forPath: home),
-          let freeSize = attributes[.systemFreeSize] as? NSNumber
-    else {
+    var location = storageURL.standardizedFileURL
+    while !FileManager.default.fileExists(atPath: location.path),
+          location.pathComponents.count > 1 {
+      location.deleteLastPathComponent()
+    }
+
+    let keys: Set<URLResourceKey> = [
+      .volumeAvailableCapacityForImportantUsageKey,
+      .volumeAvailableCapacityKey,
+    ]
+    guard let values = try? location.resourceValues(forKeys: keys) else {
       return nil
     }
 
-    return freeSize.int64Value
+    return values.volumeAvailableCapacityForImportantUsage
+      ?? values.volumeAvailableCapacity.map(Int64.init)
   }
 
   private func capture(executable: String, arguments: [String]) async -> String? {
@@ -76,7 +130,7 @@ public struct CapabilityDetector: Sendable {
     let command = Command(
       executableURL: URL(fileURLWithPath: executable),
       arguments: arguments,
-      environment: ProcessInfo.processInfo.environment,
+      environment: environmentPolicy.environment(),
       workingDirectoryURL: FileManager.default.temporaryDirectory
     )
 
