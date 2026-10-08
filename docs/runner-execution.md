@@ -26,9 +26,20 @@ swift run aci-runner execute --job Fixtures/Jobs/timeout.json
 swift run aci-runner execute --job Fixtures/Jobs/continue-after-failure.json
 ```
 
-The failure and timeout fixtures intentionally make the CLI return a nonzero status.
+The failure and timeout fixtures intentionally make the CLI return a nonzero status. Exit statuses distinguish outcomes so scripts and supervisors can react without parsing output:
 
-Pass `--workspace-root <path>` to place temporary job directories under a custom root. By default, they are created below `~/Library/Application Support/ACI/Runner/workspaces`.
+| Exit status | Meaning |
+| ---: | --- |
+| `0` | Job succeeded |
+| `1` | A step failed |
+| `65` | The job file could not be read or failed validation |
+| `70` | A runner infrastructure failure |
+| `124` | The job or a step timed out |
+| `130` | The job was cancelled by `SIGINT` or `SIGTERM` |
+
+Pass `--result <path>` to also write the complete `JobResult` as JSON.
+
+Pass `--workspace-root <path>` to place temporary job directories under a custom root. By default, they are created below `~/Library/Caches/ACI/Runner/workspaces.noindex`. The `.noindex` suffix keeps Spotlight from indexing derived data and simulator output, which measurably slows Xcode builds, and the caches location keeps build trees out of Time Machine backups.
 
 The bundled fixtures are command-only diagnostic jobs and omit the optional `repository` property. Server-created CI jobs will include a credential-free clone URL and exact commit SHA.
 
@@ -77,7 +88,7 @@ continue, stop, or cancel remaining steps
 remove workspace when configured
 ```
 
-`JobExecutor` coordinates the job. It validates the complete specification before creating a workspace, calculates the overall job deadline, resolves step working directories inside the workspace, merges step variables over the runner environment, and runs steps sequentially.
+`JobExecutor` coordinates the job. It validates the complete specification before creating a workspace, calculates the overall job deadline, resolves step working directories inside the workspace, merges step variables over the allowlisted runner environment, and runs steps sequentially.
 
 `CommandExecutor` handles one command. It receives only resolved runtime values: an absolute executable path, an argument array, a complete environment, and a working-directory URL.
 
@@ -104,7 +115,9 @@ Repository preparation runs before user command steps:
 2. Fetch only the requested commit with no tags and depth one.
 3. Check out that exact SHA in detached-HEAD mode.
 
-The checkout does not depend on a mutable remote branch at execution time. Global and system Git configuration are disabled, and `GIT_TERMINAL_PROMPT=0` prevents a self-hosted runner from hanging on an interactive credential request.
+The checkout does not depend on a mutable remote branch at execution time. Global and system Git configuration are disabled, and `GIT_TERMINAL_PROMPT=0` prevents a self-hosted runner from hanging on an interactive credential request. Each invocation also passes `-c protocol.version=2 -c gc.auto=0 -c core.fsmonitor=false -c fetch.recurseSubmodules=no -c advice.detachedHead=false` so no background maintenance, filesystem-monitor daemon, or implicit submodule traffic runs inside the workspace.
+
+Fetch is the only network stage and the only one that is retried. A failed fetch is retried up to two times, after two and then five seconds, when Git's diagnostics do not indicate a permanent condition. Unknown commits (`not our ref`), missing repositories, and rejected credentials fail immediately. A retry is skipped when the remaining job time could not accommodate it, and each retry is announced on the checkout step's stderr.
 
 Checkout shares the overall job deadline and uses the same process-group cancellation and log pipeline as user commands. Its logs and result use the reserved synthetic `checkout` step identifier, which user command steps cannot reuse when a repository is present. A Git exit failure is a job failure; inability to launch Git is an infrastructure failure.
 
@@ -125,7 +138,21 @@ Shell behavior must be requested explicitly. For example:
 }
 ```
 
-The runner does not search `PATH` for the executable in the current contract. Job producers must provide an absolute executable path.
+The runner does not search `PATH` for the executable in the current contract. Job producers must provide an absolute executable path beginning with `/`; `~`-prefixed paths are rejected.
+
+## Step environment
+
+Steps do not inherit the runner's complete environment. A future service process will hold runner credentials and lease tokens there, and repository code must never see them. `ProcessEnvironmentPolicy` copies only an allowlist of host variables (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `COMMAND_MODE`, `DEVELOPER_DIR`, `__CF_USER_TEXT_ENCODING`, `XPC_FLAGS`, `XPC_SERVICE_NAME`). The runner then adds:
+
+| Variable | Value |
+| --- | --- |
+| `CI`, `ACI` | `true` |
+| `ACI_JOB_ID` | The lowercase job identifier |
+| `ACI_WORKSPACE` | The absolute workspace root |
+| `ACI_COMMIT_SHA` | The checked-out commit, when a repository is present |
+| `ACI_TMPDIR`, `TMPDIR` | `<workspace>/.aci/tmp`, removed with the workspace |
+
+Step-level `environment` values are merged last and override both sets. Git and capability probes use the same allowlist.
 
 ## Process isolation and teardown
 
@@ -159,6 +186,8 @@ SIGKILL the process group
 
 The production default grace period is two seconds. Tests inject a shorter duration so escalation behavior can be verified quickly.
 
+Because steps run in their own session, they never receive the terminal's `SIGINT` or launchd's `SIGTERM`; only the runner's teardown can stop them. The CLI therefore routes `SIGINT` and `SIGTERM` into cancellation of the job task, which terminates the process group, removes the workspace, prints the summary, and exits with status `130`. `SIGPIPE` is handled so a closed log consumer (`aci-runner execute … | head`) stops log output without killing the job. Signal handlers, rather than `SIG_IGN`, are installed so step processes start with default dispositions.
+
 Process-group control is not a sandbox. A repository command still has the filesystem, network, keychain, and other permissions of the macOS account running `aci-runner`. Self-hosted operators must treat repository code as trusted for that machine until stronger isolation is introduced.
 
 A descendant can also deliberately create a different session or process group and escape group-directed teardown. Hosted runners will ultimately require an ephemeral VM or equivalent isolation boundary.
@@ -178,9 +207,15 @@ The runner distinguishes why execution stopped:
 | Nonzero exit status | `failed` | Stop unless `continueOnError` is true |
 | Effective deadline reached | `timedOut` | Stop the job |
 | Parent Swift task cancelled | `cancelled` | Stop the job |
-| Executor infrastructure error | thrown error | Record `infrastructureFailed` |
+| Step executable or working directory does not exist | thrown `executableUnavailable` / `workingDirectoryUnavailable` | Record `failed`; honor `continueOnError` |
+| Step working directory resolves outside the workspace | thrown `WorkspaceError` | Record `failed` |
+| Any other launch or I/O error | thrown error | Record `infrastructureFailed` |
 
-The exit code for signal termination is the signal number reported by Swift Subprocess. For example, forced termination by `SIGKILL` is represented by `9` together with an `uncaughtSignal` termination reason.
+A workflow that names a tool or directory missing from this runner is a job mistake, not a runner fault. Classifying it as `failed` keeps a future scheduler from re-dispatching the same broken job across the pool. The same launch failure for a runner-owned tool, such as Git, remains an infrastructure failure.
+
+The deadline timer and caller cancellation race against natural process exit. A single first-writer-wins state records which happened first, so a process that exited at the deadline is classified by its exit status rather than reported as timed out.
+
+The exit code for signal termination is the signal number reported by Swift Subprocess, and `StepResult.terminationReason` records whether `exitCode` is an exit status or a signal. A step that honors `SIGTERM` reports `15`; one that ignores it and is force-killed reports `9`, and both carry `uncaughtSignal`. Without the reason, an exit status of `9` would be indistinguishable from `SIGKILL`.
 
 ## Output and log ordering
 
@@ -194,7 +229,9 @@ The future network log protocol will add batching, acknowledgements, retries, si
 
 ## Workspace cleanup
 
-`JobExecutor` removes the workspace in a `defer` block when `cleanAfterExecution` is enabled. Cleanup therefore runs after success, command failure, timeout, cancellation, and infrastructure failure.
+`JobExecutor` removes the workspace after orchestration finishes when `cleanAfterExecution` is enabled. Cleanup therefore runs after success, command failure, timeout, cancellation, and infrastructure failure.
+
+Build tools leave read-only directories behind. When removal fails, `WorkspaceManager` restores owner permissions on every directory beneath the workspace without following symbolic links and tries once more. A cleanup failure is never silent: it is logged through `os.Logger` and reported in `JobResult.warnings`, which the CLI prints, because an unnoticed cleanup failure eventually fills the disk.
 
 Workspace cleanup is separate from process teardown. On timeout and cancellation, the process group is terminated before execution returns and before the workspace is removed.
 
@@ -212,11 +249,25 @@ The command-executor tests cover:
 - A descendant retaining inherited pipe descriptors.
 - UTF-8 scalars split across separate writes.
 - Large simultaneous stdout and stderr streams.
+- The real termination signal is reported after a timeout.
+- A process exiting at the deadline is not misreported as timed out.
+- Missing executables and working directories throw typed launch failures.
+
+Job-executor behavior tests with real processes verify:
+
+- A working directory that escapes the workspace mid-job fails that step and keeps earlier results.
+- Missing user executables and directories are step failures; a missing runner tool is an infrastructure failure.
+- Step results carry exit codes and termination reasons.
+- Steps receive the allowlisted environment, the ACI variables, and a workspace-local `TMPDIR`.
+- Cancelling the job terminates the running step and removes the workspace.
+- The job deadline prevents later steps from starting.
+- Workspaces are removed after every outcome.
 
 Repository-preparation tests create real temporary Git repositories and verify:
 
 - An older requested commit is checked out instead of the current branch tip.
-- An unknown but well-formed commit SHA fails during fetch.
+- An unknown but well-formed commit SHA fails during fetch without retries.
+- Transient fetch failures are retried and announced before checkout proceeds.
 - Git is not launched after the overall job deadline.
 - Checkout failures prevent later command steps from running.
 - Clone URLs, commit SHAs, and the reserved checkout step ID are validated.
