@@ -7,14 +7,26 @@ import System
 ///
 /// A process that launches and returns a nonzero exit code does not throw this
 /// error; it produces a ``CommandExecutionResult`` with a failed outcome.
+///
+/// ``executableUnavailable`` and ``workingDirectoryUnavailable`` describe
+/// problems with the values a job supplied. ``JobExecutor`` treats them as
+/// step failures for user commands so a workflow typo is not retried as a
+/// runner fault, while runner-owned tools such as Git still report them as
+/// infrastructure failures.
 public enum CommandExecutionError: LocalizedError, Sendable, Equatable {
   case invalidTimeout(Int)
+  case executableUnavailable(path: String)
+  case workingDirectoryUnavailable(path: String)
   case launchFailed(executable: String, reason: String)
 
   public var errorDescription: String? {
     switch self {
     case let .invalidTimeout(timeout):
       "Command timeout must be greater than zero; received \(timeout)."
+    case let .executableUnavailable(path):
+      "Executable '\(path)' does not exist or is not executable."
+    case let .workingDirectoryUnavailable(path):
+      "Working directory '\(path)' does not exist or is not a directory."
     case let .launchFailed(executable, reason):
       "Unable to execute '\(executable)': \(reason)"
     }
@@ -74,9 +86,11 @@ public struct CommandExecutor: CommandExecuting, Sendable {
     let configuration = makeConfiguration(for: command)
 
     // Keep the subprocess in its own task so both the explicit command timeout
-    // and cancellation of the enclosing job can request the same teardown.
+    // and cancellation of the enclosing job can request the same teardown. The
+    // task records completion itself so no interruption can be attributed to a
+    // process that had already exited.
     let executionTask = Task {
-      try await Subprocess.run(
+      let result = try await Subprocess.run(
         configuration,
         input: .none,
         output: .sequence,
@@ -100,40 +114,40 @@ public struct CommandExecutor: CommandExecuting, Sendable {
           try await group.waitForAll()
         }
       }
+      return (status: result.terminationStatus, interruption: executionState.finish())
     }
 
     // Reaching the deadline cancels the subprocess task. `Subprocess` then
     // runs the configured process-group teardown before the task completes.
     let timeoutTask = Task {
-      do {
-        try await Task.sleep(for: .seconds(timeoutSeconds))
-        await executionState.markTimedOut()
-        executionTask.cancel()
-      } catch {
+      guard (try? await Task.sleep(for: .seconds(timeoutSeconds))) != nil else {
         // Cancelling the timer is the normal path when the process exits first.
+        return
+      }
+      if executionState.interrupt(.timedOut) {
+        executionTask.cancel()
       }
     }
+    defer { timeoutTask.cancel() }
 
     do {
-      let result = try await withTaskCancellationHandler {
+      let (terminationStatus, interruption) = try await withTaskCancellationHandler {
         try await executionTask.value
       } onCancel: {
-        executionTask.cancel()
+        if executionState.interrupt(.cancelled) {
+          executionTask.cancel()
+        }
       }
 
-      timeoutTask.cancel()
-      _ = await timeoutTask.result
-
-      let status = commandStatus(from: result.terminationStatus)
+      let status = commandStatus(from: terminationStatus)
       let outcome: CommandOutcome
-      if Task.isCancelled {
+      switch interruption {
+      case .cancelled:
         outcome = .cancelled
-      } else if await executionState.didTimeOut {
+      case .timedOut:
         outcome = .timedOut
-      } else if result.terminationStatus.isSuccess {
-        outcome = .succeeded
-      } else {
-        outcome = .failed
+      case .none:
+        outcome = terminationStatus.isSuccess ? .succeeded : .failed
       }
 
       return CommandExecutionResult(
@@ -144,28 +158,25 @@ public struct CommandExecutor: CommandExecuting, Sendable {
         finishedAt: Date()
       )
     } catch {
-      timeoutTask.cancel()
       executionTask.cancel()
-      _ = await timeoutTask.result
       _ = await executionTask.result
 
       // Cancellation can surface as `CancellationError` before a termination
-      // status is available. The teardown has still completed by this point.
-      let didTimeOut = await executionState.didTimeOut
-      if Task.isCancelled || didTimeOut {
+      // status is available. The teardown has still completed by this point,
+      // and `SIGKILL` is the only status the teardown sequence guarantees.
+      let interruption = executionState.finish()
+      switch interruption {
+      case .cancelled, .timedOut:
         return CommandExecutionResult(
-          outcome: Task.isCancelled ? .cancelled : .timedOut,
+          outcome: interruption == .cancelled ? .cancelled : .timedOut,
           exitCode: SIGKILL,
           terminationReason: .uncaughtSignal,
           startedAt: startedAt,
           finishedAt: Date()
         )
+      case .none:
+        throw classifyLaunchError(error, for: command)
       }
-
-      throw CommandExecutionError.launchFailed(
-        executable: command.executableURL.path,
-        reason: String(describing: error)
-      )
     }
   }
 
@@ -196,6 +207,24 @@ public struct CommandExecutor: CommandExecuting, Sendable {
     )
   }
 
+  private func classifyLaunchError(_ error: any Error, for command: Command) -> CommandExecutionError {
+    if let subprocessError = error as? SubprocessError {
+      switch subprocessError.code {
+      case .executableNotFound:
+        return .executableUnavailable(path: command.executableURL.path)
+      case .failedToChangeWorkingDirectory:
+        return .workingDirectoryUnavailable(path: command.workingDirectoryURL.path)
+      default:
+        break
+      }
+    }
+
+    return .launchFailed(
+      executable: command.executableURL.path,
+      reason: String(describing: error)
+    )
+  }
+
   private func commandStatus(
     from status: Subprocess.TerminationStatus
   ) -> (code: Int32, reason: CommandTerminationReason) {
@@ -214,11 +243,15 @@ public struct CommandExecutor: CommandExecuting, Sendable {
   ) async throws {
     var decoder = IncrementalUTF8Decoder()
 
-    for try await buffer in output {
-      let data = Data(buffer: buffer)
-      if let text = decoder.decode(data), !text.isEmpty {
-        await sequencer.emit(text, stream: stream)
+    do {
+      for try await buffer in output {
+        if let text = decoder.decode(buffer), !text.isEmpty {
+          await sequencer.emit(text, stream: stream)
+        }
       }
+    } catch is CancellationError {
+      // Teardown is already in progress. Stop reading so the real termination
+      // status can still be reported instead of failing the whole body.
     }
 
     if let text = decoder.finish(), !text.isEmpty {
@@ -227,11 +260,37 @@ public struct CommandExecutor: CommandExecuting, Sendable {
   }
 }
 
-private actor ExecutionState {
-  private(set) var didTimeOut = false
+/// Records, exactly once, why a command stopped before its process exited.
+///
+/// Both the deadline timer and caller cancellation race against natural
+/// process exit. Serializing those transitions under one lock guarantees that
+/// a process which already finished is never reported as interrupted.
+private final class ExecutionState: @unchecked Sendable {
+  enum Interruption: Equatable {
+    case none
+    case timedOut
+    case cancelled
+  }
 
-  func markTimedOut() {
-    didTimeOut = true
+  private let lock = NSLock()
+  private var interruption: Interruption = .none
+  private var hasFinished = false
+
+  /// Returns `true` when this call is the first interruption of a running command.
+  func interrupt(_ reason: Interruption) -> Bool {
+    lock.withLock {
+      guard !hasFinished, interruption == .none else { return false }
+      interruption = reason
+      return true
+    }
+  }
+
+  /// Marks the command finished and returns the interruption that preceded it.
+  func finish() -> Interruption {
+    lock.withLock {
+      hasFinished = true
+      return interruption
+    }
   }
 }
 
@@ -239,14 +298,25 @@ private actor ExecutionState {
 private struct IncrementalUTF8Decoder {
   private var pendingBytes: [UInt8] = []
 
-  mutating func decode(_ data: Data) -> String? {
-    pendingBytes.append(contentsOf: data)
-    let completePrefixCount = completePrefixLength(in: pendingBytes)
-    guard completePrefixCount > 0 else { return nil }
+  mutating func decode(_ buffer: SubprocessOutputSequence.Buffer) -> String? {
+    buffer.withUnsafeBytes { bytes -> String? in
+      // Fast path: nothing is pending and the chunk ends on a scalar boundary,
+      // so it can be decoded without copying through the pending buffer.
+      if pendingBytes.isEmpty {
+        let completeCount = completePrefixLength(in: bytes)
+        if completeCount == bytes.count {
+          return bytes.isEmpty ? nil : String(decoding: bytes, as: UTF8.self)
+        }
+      }
 
-    let completeBytes = pendingBytes.prefix(completePrefixCount)
-    pendingBytes.removeFirst(completePrefixCount)
-    return String(decoding: completeBytes, as: UTF8.self)
+      pendingBytes.append(contentsOf: bytes)
+      let completePrefixCount = pendingBytes.withUnsafeBytes(completePrefixLength)
+      guard completePrefixCount > 0 else { return nil }
+
+      let text = String(decoding: pendingBytes[..<completePrefixCount], as: UTF8.self)
+      pendingBytes.removeFirst(completePrefixCount)
+      return text
+    }
   }
 
   mutating func finish() -> String? {
@@ -256,7 +326,7 @@ private struct IncrementalUTF8Decoder {
   }
 
   /// Returns a prefix that cannot end inside a potentially valid UTF-8 scalar.
-  private func completePrefixLength(in bytes: [UInt8]) -> Int {
+  private func completePrefixLength(in bytes: UnsafeRawBufferPointer) -> Int {
     guard let lastByte = bytes.last else { return 0 }
     if lastByte & 0b1000_0000 == 0 { return bytes.count }
 

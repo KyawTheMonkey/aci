@@ -74,7 +74,63 @@ struct CommandExecutorTests {
       onLog: { _ in }
     )
 
+    // `sleep` honors SIGTERM, so the real signal is reported rather than an
+    // assumed SIGKILL.
     #expect(result.outcome == .timedOut)
+    #expect(result.exitCode == SIGTERM)
+    #expect(result.terminationReason == .uncaughtSignal)
+  }
+
+  @Test("A process that exits exactly at the deadline is still classified by its exit status")
+  func exitAtDeadlineIsNotATimeout() async throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let command = Command(
+      executableURL: URL(fileURLWithPath: "/usr/bin/true"),
+      arguments: [],
+      environment: ProcessInfo.processInfo.environment,
+      workingDirectoryURL: directory
+    )
+
+    // Many quick runs with the shortest timeout exercise the window between
+    // process exit and timer expiry; none may report a timeout.
+    for _ in 0..<20 {
+      let result = try await CommandExecutor().execute(
+        command,
+        stepID: "deadline-race",
+        timeoutSeconds: 1,
+        onLog: { _ in }
+      )
+      #expect(result.outcome == .succeeded)
+    }
+  }
+
+  @Test("Missing executables and directories are reported as user launch failures", arguments: [
+    (executable: "/opt/aci/not-installed", directory: nil as String?),
+    (executable: "/usr/bin/true", directory: "does-not-exist"),
+  ])
+  func classifiesLaunchFailures(executable: String, directory: String?) async throws {
+    let base = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: base) }
+    let workingDirectory = directory.map { base.appendingPathComponent($0) } ?? base
+    let command = Command(
+      executableURL: URL(fileURLWithPath: executable),
+      arguments: [],
+      environment: ProcessInfo.processInfo.environment,
+      workingDirectoryURL: workingDirectory
+    )
+
+    let expected: CommandExecutionError = directory == nil
+      ? .executableUnavailable(path: executable)
+      : .workingDirectoryUnavailable(path: workingDirectory.path)
+    await #expect(throws: expected) {
+      try await CommandExecutor().execute(
+        command,
+        stepID: "launch",
+        timeoutSeconds: 5,
+        onLog: { _ in }
+      )
+    }
   }
 
   @Test("Cancellation terminates a running process")
