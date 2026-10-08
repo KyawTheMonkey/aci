@@ -38,6 +38,28 @@ struct WorkspaceManagerTests {
     try manager.removeWorkspace(workspace)
   }
 
+  @Test("Removes workspaces that contain read-only directories")
+  func removesReadOnlyTree() throws {
+    let base = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: base) }
+    let manager = try WorkspaceManager(baseDirectory: base)
+    let workspace = try manager.createWorkspace(for: UUID())
+    let locked = workspace.rootURL
+      .appendingPathComponent("DerivedData", isDirectory: true)
+      .appendingPathComponent("locked", isDirectory: true)
+    try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+    try Data("artifact".utf8).write(to: locked.appendingPathComponent("file.txt"))
+    try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: locked.path)
+    try FileManager.default.setAttributes(
+      [.posixPermissions: 0o555],
+      ofItemAtPath: locked.deletingLastPathComponent().path
+    )
+
+    try manager.removeWorkspace(workspace)
+
+    #expect(!FileManager.default.fileExists(atPath: workspace.rootURL.path))
+  }
+
   @Test("Rejects lexical parent traversal")
   func rejectsParentTraversal() throws {
     let base = try makeTemporaryDirectory()

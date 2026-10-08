@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Creates isolated job directories and resolves contained paths.
@@ -84,6 +85,11 @@ public struct WorkspaceManager: WorkspaceManaging, Sendable {
   /// Canonical containment is checked again immediately before deletion. If
   /// repository code replaced the workspace with an external symbolic link,
   /// cleanup fails closed instead of deleting the external target.
+  ///
+  /// Build tools routinely leave read-only directories behind. When the first
+  /// removal fails, owner permissions are restored beneath the workspace and
+  /// removal is attempted once more; a second failure is reported to the
+  /// caller rather than swallowed.
   public func removeWorkspace(_ workspace: Workspace) throws {
     let canonicalBase = baseDirectory.resolvingSymlinksInPath().standardizedFileURL
     let canonicalWorkspace = workspace.rootURL.resolvingSymlinksInPath().standardizedFileURL
@@ -96,7 +102,12 @@ public struct WorkspaceManager: WorkspaceManaging, Sendable {
 
     let fileManager = FileManager.default
     if fileManager.fileExists(atPath: canonicalWorkspace.path) {
-      try fileManager.removeItem(at: canonicalWorkspace)
+      do {
+        try fileManager.removeItem(at: canonicalWorkspace)
+      } catch {
+        restoreOwnerPermissions(beneath: canonicalWorkspace)
+        try fileManager.removeItem(at: canonicalWorkspace)
+      }
     }
 
     let jobDirectory = canonicalWorkspace.deletingLastPathComponent()
@@ -148,5 +159,36 @@ public struct WorkspaceManager: WorkspaceManaging, Sendable {
       resolved.appendPathComponent(component)
     }
     return resolved.standardizedFileURL
+  }
+
+  /// Grants the owner read, write, and search permission on every directory
+  /// beneath `root` without following symbolic links.
+  ///
+  /// Unlinking an entry requires write permission on its parent directory, so
+  /// only directories need adjusting. `lchmod` never follows a link, which
+  /// keeps a workspace symlink from changing permissions outside the tree.
+  private func restoreOwnerPermissions(beneath root: URL) {
+    var directories = [root]
+    if let enumerator = FileManager.default.enumerator(
+      at: root,
+      includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+      options: []
+    ) {
+      for case let url as URL in enumerator {
+        guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              values.isSymbolicLink != true,
+              values.isDirectory == true
+        else { continue }
+        directories.append(url)
+      }
+    }
+
+    for directory in directories {
+      var status = stat()
+      guard lstat(directory.path, &status) == 0,
+            (status.st_mode & S_IFMT) == S_IFDIR
+      else { continue }
+      _ = lchmod(directory.path, status.st_mode | S_IRWXU)
+    }
   }
 }
